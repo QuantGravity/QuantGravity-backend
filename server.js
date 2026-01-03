@@ -441,8 +441,10 @@ app.post('/api/update-prices', async (req, res) => {
         if (tickers && tickers.length > 0) {
             targetTickers = tickers.map(s => ({ ticker: s }));
         } else {
-            // [수정] 티커 마스터도 Firestore에서 가져오도록 변경 가능 (현재는 수동 입력 가정)
-            targetTickers = [{ ticker: '^IXIC' }, { ticker: '^GSPC' }]; 
+            // [핵심 수정] 티커가 없으면 Firestore 'tickers' 컬렉션에서 전체 목록을 가져옴
+            const snapshot = await firestore.collection('tickers').get();
+            targetTickers = snapshot.docs.map(doc => ({ ticker: doc.id }));
+            console.log(`[Batch] DB에서 ${targetTickers.length}개의 티커를 불러왔습니다.`);
         }
 
         const today = new Date();
