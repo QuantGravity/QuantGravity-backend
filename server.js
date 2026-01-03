@@ -1,12 +1,23 @@
 // File Name : server.js
 const express = require('express');
 const path = require('path');
-const db = require('./db');
+const cors = require('cors'); // 추가
+const cron = require('node-cron');
 
 require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+// [추가] CORS 설정: 프론트엔드 호스트 허용
+app.use(cors({
+    origin: [
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'https://quant-navigator-backend.onrender.com' // 본인의 Render 주소
+    ],
+    credentials: true
+}));
 
 // 정적 파일 설정 및 JSON 파싱 미들웨어
 app.use(express.static(path.join(__dirname, '../front')));
@@ -99,9 +110,18 @@ app.post('/api/upload-to-firestore', async (req, res) => {
             return res.status(400).json({ error: "컬렉션 이름과 데이터는 필수입니다." });
         }
 
+        // 1. 실제 바이트(Byte) 용량 계산 (UTF-8 기준)
         const jsonString = JSON.stringify(data);
-        // 로그 출력은 유지하되 보안상 필요한 정보만 남깁니다.
-        console.log(`[Firestore Upload] ${collectionName}/${docId || 'new'} - Size: ${(jsonString.length / 1024).toFixed(2)} KB`);
+        const byteSize = Buffer.byteLength(jsonString, 'utf8');
+        const kbSize = (byteSize / 1024).toFixed(2);
+
+        // 2. 터미널 로그 출력 (용량 확인용)
+        console.log(`--------------------------------------------------`);
+        console.log(`[Firestore Upload Log]`);
+        console.log(`- 경로: ${collectionName}/${docId || 'auto-gen'}`);
+        console.log(`- 용량: ${byteSize} bytes (${kbSize} KB)`);
+        console.log(`- 데이터 개수: ${data.values ? data.values.length : 'N/A'} rows`);
+        console.log(`--------------------------------------------------`);
 
         if (jsonString.length > 1048487) {
             return res.status(413).json({ error: "Firestore 단일 문서 용량 제한(1MB)을 초과했습니다." });
@@ -238,59 +258,41 @@ function nper_custom(rate, pv, fv) {
     }
 }
 
-// [수정된 핵심 로직 함수] 권한과 모드에 따라 DB 또는 파이어스토어 선택 조회
-async function getDailyStockData(role, mode, ticker, start, end) {
-    // 관리자이면서 관리자 모드인 경우만 로컬 MySQL 조회
-    const isFullAdmin = (role === 'admin' && mode === 'admin');
-
+// ----------------------------------------------------------------
+// [수정] 주가 데이터 조회 함수 (Firestore 전용)
+// ----------------------------------------------------------------
+async function getDailyStockData(ticker, start, end) {
     try {
-        if (isFullAdmin) {
-            // --- 1. 로컬 MySQL DB 조회 경로 ---
-            let query = 'SELECT date, open_price, high_price, low_price, close_price FROM trade_data_day WHERE ticker = ?';
-            let params = [ticker];
-            if (start && end) {
-                query += ' AND date BETWEEN ? AND ?';
-                params.push(start, end);
-            }
-            query += ' ORDER BY date ASC';
-
-            const [rows] = await db.query(query, params);
-            return rows;
-        } else {
-            // --- 2. 파이어스토어 조회 경로 (사용자 모드) ---
-            const doc = await firestore.collection('ticker_prices').doc(ticker).get();
-            
-            if (!doc.exists) {
-                console.warn(`파이어스토어에 데이터 없음: ${ticker}`);
-                return []; // 데이터가 없으면 빈 배열 반환
-            }
-
-            const data = doc.data();
-            const labels = data.labels || [];
-            const values = data.values || [];
-
-            // 파이어스토어의 배열 구조를 MySQL 결과와 동일한 객체 배열 포맷으로 변환
-            const rows = labels.map((date, index) => {
-                const dDate = date.includes('T') ? date.split('T')[0] : date;
-                return {
-                    date: dDate,
-                    close_price: values[index],
-                    // 파이어스토어에는 시가/고가/저가가 없을 수 있으므로 종가로 대체하거나 처리
-                    open_price: values[index],
-                    high_price: values[index],
-                    low_price: values[index]
-                };
-            }).filter(row => {
-                // 기간 필터링
-                if (start && end) return row.date >= start && row.date <= end;
-                return true;
-            });
-
-            // 날짜순 정렬
-            return rows.sort((a, b) => a.date.localeCompare(b.date));
+        // 무조건 Firestore 'ticker_prices' 컬렉션 조회
+        const doc = await firestore.collection('ticker_prices').doc(ticker).get();
+        
+        if (!doc.exists) {
+            console.warn(`Firestore에 데이터 없음: ${ticker}`);
+            return [];
         }
+
+        const data = doc.data();
+        const labels = data.labels || [];
+        const values = data.values || [];
+
+        // 데이터를 객체 배열 포맷으로 변환 및 필터링
+        const rows = labels.map((date, index) => {
+            const dDate = date.includes('T') ? date.split('T')[0] : date;
+            return {
+                date: dDate,
+                close_price: values[index],
+                open_price: values[index], // 종가로 대체
+                high_price: values[index],
+                low_price: values[index]
+            };
+        }).filter(row => {
+            if (start && end) return row.date >= start && row.date <= end;
+            return true;
+        });
+
+        return rows.sort((a, b) => a.date.localeCompare(b.date));
     } catch (err) {
-        console.error(`데이터 조회 에러 (${ticker}):`, err.message);
+        console.error(`Firestore 조회 에러 (${ticker}):`, err.message);
         throw err;
     }
 }
@@ -299,32 +301,12 @@ async function getDailyStockData(role, mode, ticker, start, end) {
 // [백엔드] 권한 기반 통합 주가 조회 API
 app.get('/api/stocks-bulk', async (req, res) => {
     // mode 파라미터 추가 수신
-    const { role, mode, tickers, start, end } = req.query; 
+    const { tickers, start, end } = req.query; 
     if (!tickers) return res.status(400).json({ error: "티커 코드가 없습니다." });
 
     const tickerList = tickers.split(',');
 
-    // 최종 판정: role과 mode가 모두 admin일 때만 MySQL로 분기
-    const isFullAdminRequest = (role === 'admin' && mode === 'admin');
-
     try {
-        // [수정] 권한이 admin이고, 현재 페이지 모드도 admin일 때만 로컬 DB 조회
-        if (isFullAdminRequest) {
-            let query = 'SELECT ticker, date, close_price FROM trade_data_day WHERE ticker IN (?)';
-            let params = [tickerList];
-
-            if (start && end) {
-                query += ' AND date BETWEEN ? AND ?';
-                params.push(start, end);
-            }
-            query += ' ORDER BY date ASC';
-
-            const [rows] = await db.query(query, params);
-            return res.json(rows);
-        } 
-        
-        // 2. 일반 사용자(user) 또는 권한 미지정: Firestore 'ticker_prices' 컬렉션 조회
-        else {
             const bulkResults = [];
             
             // 병렬 처리를 통해 여러 티커 데이터를 Firestore에서 가져옴
@@ -355,7 +337,7 @@ app.get('/api/stocks-bulk', async (req, res) => {
             bulkResults.sort((a, b) => a.date.localeCompare(b.date));
             return res.json(bulkResults);
         }
-    } catch (err) {
+    catch (err) {
         console.error(`Bulk fetch error:`, err.message);
         res.status(500).json({ error: "주가 데이터를 불러오는 중 오류가 발생했습니다." });
     }
@@ -414,6 +396,13 @@ app.get('/api/tickers', async (req, res) => {
 // ----------------------------------------------------------------
 // 2. 야후 파이낸스 가격 업데이트 (Upsert 로직 적용)
 // ----------------------------------------------------------------
+// 1초 ~ 2초 사이 랜덤 딜레이 (1000ms ~ 2000ms)
+function delay() {
+    const min = 1000;  // 1초
+    const max = 2000;  // 2초
+    const delayTime = Math.floor(Math.random() * (max - min + 1)) + min;
+    return new Promise(resolve => setTimeout(resolve, delayTime));
+}
 
 async function fetchWithChunks(ticker, start, end) {
     const chunks = [];
@@ -444,14 +433,6 @@ async function fetchWithChunks(ticker, start, end) {
     return chunks;
 }
 
-// 1초 ~ 2초 사이 랜덤 딜레이 (1000ms ~ 2000ms)
-function delay() {
-    const min = 1000;  // 1초
-    const max = 2000;  // 2초
-    const delayTime = Math.floor(Math.random() * (max - min + 1)) + min;
-    return new Promise(resolve => setTimeout(resolve, delayTime));
-}
-
 app.post('/api/update-prices', async (req, res) => {
     try {
         const { startDate, endDate, tickers } = req.body; 
@@ -460,102 +441,87 @@ app.post('/api/update-prices', async (req, res) => {
         if (tickers && tickers.length > 0) {
             targetTickers = tickers.map(s => ({ ticker: s }));
         } else {
-            const [rows] = await db.query('SELECT ticker FROM ticker_master');
-            targetTickers = rows;
+            // [수정] 티커 마스터도 Firestore에서 가져오도록 변경 가능 (현재는 수동 입력 가정)
+            targetTickers = [{ ticker: '^IXIC' }, { ticker: '^GSPC' }]; 
         }
 
-        // Grok 이 추천한 코드
         const today = new Date();
-        today.setUTCHours(0, 0, 0, 0); // 오늘 00:00 UTC로 맞춤
+        today.setUTCHours(0, 0, 0, 0);
 
         let endDateObj = endDate ? new Date(endDate) : today;
-
-        // 미래라면 오늘로 클립
         if (endDateObj > today) {
-            console.warn(`endDate(${endDate})가 미래/오늘입니다. 오늘 이전으로 제한합니다.`);
             endDateObj = new Date(today);
-            endDateObj.setDate(endDateObj.getDate() - 1); // 안전하게 어제까지
+            endDateObj.setDate(endDateObj.getDate() - 1);
         }
-
-        // 여기서 핵심! Yahoo는 period2를 exclusive로 취급하므로 +1일
         endDateObj.setDate(endDateObj.getDate() + 1);
-        const period2 = endDateObj.toISOString().split('T')[0]; // YYYY-MM-DD 형식
+        const period2 = endDateObj.toISOString().split('T')[0];
 
-        // === period1 정의 추가 (이게 빠졌어요!) ===
-        let startDateObj = startDate ? new Date(startDate) : new Date('2010-01-01'); // 안전한 과거 기본값
+        let startDateObj = startDate ? new Date(startDate) : new Date('2010-01-01');
+        if (startDateObj > endDateObj) startDateObj = new Date(endDateObj);
+        const period1 = startDateObj.toISOString().split('T')[0];
 
-        // 시작일이 종료일보다 미래면 안 됨
-        if (startDateObj > endDateObj) {
-            console.warn(`startDate(${startDate})가 endDate보다 미래입니다. endDate로 조정합니다.`);
-            startDateObj = new Date(endDateObj);
-        }
-
-        const period1 = startDateObj.toISOString().split('T')[0]; // ← 이 줄이 누락됐어요!
-
-        // ----------------------------------------------------
-
-        // (로그 위치 수정) 여기서 ticker를 쓰면 에러가 납니다. 아래처럼 수정하세요.
-        console.log(`[작업 시작] 총 ${targetTickers.length}개 티커 수집 시작`);
-        console.log(`요청 기간: ${period1} ~ ${period2}`);
+        console.log(`[작업 시작] 총 ${targetTickers.length}개 티커 수집 시작 (${period1} ~ ${period2})`);
 
         const results = [];
 
         for (const item of targetTickers) {
             const ticker = item.ticker.trim().toUpperCase();
             try {
-                console.log(`[티커 : ${ticker} ]`);
-
+                console.log(`[티커 : ${ticker} ] 야후 데이터 호출...`);
                 const history = await fetchWithChunks(ticker, period1, period2);
 
-                console.log(`[${ticker}] 수신정보 건수 : ${history.length}건`);
-
                 if (history && history.length > 0) {
+                    // --- 1. Firestore 형식으로 데이터 가공 ---
+                    // 날짜(labels)와 종가(values) 배열 생성
+                    const labels = [];
+                    const values = [];
+
                     for (const quote of history) {
-                        if (!quote.date) continue;
-
-                        // === [추가] 0 데이터 필터링 로직 ===
-                        // 시가, 고가, 저가, 종가 중 하나라도 0이거나 유효하지 않으면 저장하지 않음
-                        if (!quote.open || !quote.high || !quote.low || !quote.close || 
-                            quote.open === 0 || quote.high === 0 || quote.low === 0 || quote.close === 0) {
-                            console.log(`[${ticker}] ${quote.date} 데이터가 0이므로 건너뜁니다.`);
-                            continue; 
-                        }
-                        // =================================
-
+                        if (!quote.date || !quote.close || quote.close === 0) continue;
+                        
                         const quoteDate = new Date(quote.date).toISOString().split('T')[0];
-                        
-                        // ON DUPLICATE KEY UPDATE: 있으면 업데이트, 없으면 삽입
-                        const sql = `
-                            INSERT INTO trade_data_day (ticker, date, open_price, high_price, low_price, close_price, volume)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                            ON DUPLICATE KEY UPDATE 
-                                open_price = VALUES(open_price),
-                                high_price = VALUES(high_price),
-                                low_price = VALUES(low_price),
-                                close_price = VALUES(close_price),
-                                volume = VALUES(volume)
-                        `;
-                        
-                        await db.query(sql, [
-                            ticker, quoteDate, 
-                            quote.open || 0, quote.high || 0, 
-                            quote.low || 0, quote.close || 0, 
-                            quote.volume || 0
-                        ]);
+                        labels.push(quoteDate);
+                        values.push(quote.close);
                     }
-                    results.push({ ticker: ticker, status: 'Success', count: history.length });
+
+                    // --- 2. Firestore 업로드 실행 (백엔드 내부 함수 직접 호출과 유사) ---
+                    const uploadPayload = {
+                        ticker: ticker,
+                        last_updated: new Date().toISOString(),
+                        labels: labels, // 날짜 배열
+                        values: values  // 종가 배열
+                    };
+
+                    const collectionName = "ticker_prices";
+                    const docId = ticker;
+
+                    // 용량 체크
+                    const jsonString = JSON.stringify(uploadPayload);
+                    const byteSize = Buffer.byteLength(jsonString, 'utf8');
+
+                    if (byteSize > 1048576) {
+                        throw new Error(`용량 초과 (${(byteSize / 1024).toFixed(2)} KB)`);
+                    }
+
+                    // Firestore에 통째로 저장 (set)
+                    await firestore.collection(collectionName).doc(docId).set({
+                        ...uploadPayload,
+                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+
+                    console.log(`[${ticker}] Firestore 업로드 완료 (${labels.length}건, ${(byteSize / 1024).toFixed(2)} KB)`);
+                    results.push({ ticker: ticker, status: 'Success', count: labels.length, size: `${(byteSize / 1024).toFixed(2)} KB` });
+
                 } else {
                     results.push({ ticker: ticker, status: 'No Data' });
                 }
 
-                // 여기 추가: 다음 티커 처리 전에 1~2초 대기
-                console.log(`[${ticker}] 처리 완료. 다음 티커로 넘어가기 전 대기 중...`);
-                await delay();  // ← 이 부분이 핵심!
+                await delay(); // 티커 간 대기
 
             } catch (err) {
+                console.error(`[${ticker}] 에러:`, err.message);
                 results.push({ ticker: ticker, status: 'Failed', error: err.message });
             }
-            console.log(`[${ticker}] 티커별 가져오기 완료!`);
         }
         res.json({ success: true, details: results });
     } catch (err) {
@@ -570,7 +536,7 @@ app.post('/api/update-prices', async (req, res) => {
 // 특정 티커의 싸이클 계산
 app.get('/api/daily-stock', async (req, res) => {
 // 모든 인자를 query에서 한 번에 구조 분해 할당
-    const { role, mode, ticker, startDate, endDate, upperRate: uR, lowerRate: lR } = req.query;
+    const { ticker, startDate, endDate, upperRate: uR, lowerRate: lR } = req.query;
     const upperRate = parseFloat(uR) || 30; 
     const lowerRate = parseFloat(lR) || 15;
 
@@ -578,7 +544,7 @@ app.get('/api/daily-stock', async (req, res) => {
 
     try {
         // 1. 쿼리 실행 (ticker 대소문자 무시 등 대비)
-        const rows = await getDailyStockData(role, mode, ticker, startDate, endDate);
+        const rows = await getDailyStockData(ticker, startDate, endDate);
 
         console.log(`[쿼리 결과] 데이터 개수: ${rows.length}건`);
 
@@ -674,23 +640,13 @@ app.get('/api/daily-stock', async (req, res) => {
 });
 
 // ----------------------------------------------------------------
-// 목표기준 투자전략 API    -  2025.12.25 추가
+// [수정] 전략(Strategy) 관리 API (Firestore로 전환)
 // ----------------------------------------------------------------
-
-// 전략 목록 조회
 app.get('/api/strategies', async (req, res) => {
     try {
-        const query = `
-            SELECT 
-                strategy_code, ticker,
-                DATE_FORMAT(start_date, '%Y-%m-%d') as start_date, 
-                init_cash, init_stock, target_rate, upper_rate, lower_rate, unit_gap,
-                IFNULL(show_in_main, '') as show_in_main  -- NULL이면 빈 문자열로 처리
-            FROM strategy_settings
-            ORDER BY strategy_code ASC
-        `;
-        const [rows] = await db.query(query);
-        res.json(rows);
+        const snapshot = await firestore.collection('strategies').get();
+        const list = snapshot.docs.map(doc => ({ strategy_code: doc.id, ...doc.data() }));
+        res.json(list);
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -698,50 +654,42 @@ app.get('/api/strategies', async (req, res) => {
 
 app.post('/api/strategies', async (req, res) => {
     try {
-        const { 
-            strategy_code, ticker, start_date, init_cash, init_stock, 
-            target_rate, upper_rate, lower_rate, unit_gap, show_in_main
-        } = req.body;
-
-        // 1. INSERT 부분의 ? 개수를 8개로 맞춤
-        // 2. UPDATE 부분에서 strategy_code를 제외한 나머지 필드를 정확히 매칭
-        const query = `
-            INSERT INTO strategy_settings 
-                (strategy_code, ticker, start_date, init_cash, init_stock, target_rate, upper_rate, lower_rate, unit_gap, show_in_main)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON DUPLICATE KEY UPDATE 
-                ticker = VALUES(ticker),
-                start_date = VALUES(start_date),
-                init_cash = VALUES(init_cash),
-                init_stock = VALUES(init_stock),
-                target_rate = VALUES(target_rate),
-                upper_rate = VALUES(upper_rate),
-                lower_rate = VALUES(lower_rate),
-                unit_gap = VALUES(unit_gap),
-                \`show_in_main\` = VALUES(\`show_in_main\`)
-        `;
-
-        const params = [
-            strategy_code, ticker, start_date, init_cash, init_stock, 
-            target_rate, upper_rate, lower_rate, unit_gap, show_in_main
-        ];
-
-        await db.query(query, params);
+        const { strategy_code, ...rest } = req.body;
+        // upperRate, lowerRate 변수명 사용 준수
+        await firestore.collection('strategies').doc(strategy_code).set({
+            ...rest,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
         res.json({ success: true });
     } catch (e) {
-        console.error("전략 저장 에러:", e.message);
-        res.status(500).json({ success: false, error: e.message });
+        res.status(500).json({ error: e.message });
     }
 });
 
-// 전략 삭제
+// [수정] 전략 단일 삭제 API
 app.delete('/api/strategies/:strategy_code', async (req, res) => {
     try {
-        const { strategy_code } = req.params; // 여기서 decodeURIComponent가 자동 적용됨
-        const query = "DELETE FROM strategy_settings WHERE strategy_code = ?";
-        await db.query(query, [strategy_code]);
-        res.json({ success: true });
+        const { strategy_code } = req.params;
+
+        if (!strategy_code) {
+            return res.status(400).json({ error: "전략 코드가 필요합니다." });
+        }
+
+        console.log(`[Firestore Delete] Strategy: ${strategy_code}`);
+
+        // 1. 해당 전략 문서 삭제
+        await firestore.collection('strategies').doc(strategy_code).delete();
+
+        // 2. (선택 사항) 해당 전략과 연결된 시뮬레이션 결과들도 함께 삭제하고 싶다면 아래 로직 추가
+        const resultsRef = firestore.collection('simulation_results');
+        const batch = firestore.batch();
+        const snapshot = await resultsRef.where('strategy_code', '==', strategy_code).get();
+        snapshot.forEach(doc => batch.delete(doc.ref));
+        await batch.commit();
+
+        res.status(200).json({ success: true, message: "전략이 성공적으로 삭제되었습니다." });
     } catch (e) {
+        console.error("Strategy Delete Error:", e);
         res.status(500).json({ error: e.message });
     }
 });
@@ -752,8 +700,8 @@ app.get('/api/simulation-summary', async (req, res) => {
         const { ticker, start, end, initCash, initStock, targetRate, upperRate, lowerRate, unitGap } = req.query;
         
         const [tickerData, ndxData] = await Promise.all([
-            getDailyStockData('admin', 'admin', ticker, start, end),
-            getDailyStockData('admin', 'admin', '^NDX', start, end)
+            getDailyStockData(ticker, start, end),
+            getDailyStockData('^NDX', start, end)
         ]);
 
         if (!tickerData || tickerData.length === 0) {
@@ -800,7 +748,7 @@ async function runSimulationInternal(params) {
     const { ticker, start, end, initCash, initStock, targetRate, upperRate, lowerRate, unitGap } = params;
 
     // 1. 데이터 조회
-    const priceData = await getDailyStockData('admin', 'admin', ticker, start, end);
+    const priceData = await getDailyStockData(ticker, start, end);
     if (!priceData || priceData.length === 0) return null;
 
     // 2. 파라미터 초기화 (기존 변수명과 로직 준수)
@@ -951,35 +899,52 @@ async function runSimulationInternal(params) {
     return { rows, chartData, lastStatus: { ...lastRow, max_mdd_rate: maxMddRate } };
 }
 
-/* [추가] 대량 시뮬레이션 및 결과 저장 API */
+/* [수정] 대량 시뮬레이션 및 결과 저장 API (Firestore) */
 app.post('/api/bulk-simulation', async (req, res) => {
-    const { strategy_code, ticker, bulkStart, bulkEnd, targetEnd, initCash, initStock, targetRate, upperRate, lowerRate, unitGap } = req.body;
+    const { 
+        strategy_code, ticker, bulkStart, bulkEnd, targetEnd, 
+        initCash, initStock, targetRate, upperRate, lowerRate, unitGap 
+    } = req.body;
 
     try {
-        // 1. 기존 데이터 삭제
-        await db.query(
-            "DELETE FROM simulation_result WHERE strategy_code = ? AND start_date BETWEEN ? AND ?",
-            [strategy_code, bulkStart, bulkEnd]
-        );
+        console.log(`[Bulk Simulation] Start: ${strategy_code} (${bulkStart} ~ ${bulkEnd})`);
 
-        // 2. 시작일 리스트 가져오기
-        const [dateRows] = await db.query(
-            "SELECT DISTINCT date FROM trade_data_day WHERE ticker = ? AND date BETWEEN ? AND ? ORDER BY date ASC",
-            [ticker, bulkStart, bulkEnd]
-        );
+        // 1. 기존 데이터 삭제 (해당 전략코드 및 기간 내 결과물 삭제)
+        const resultsRef = firestore.collection('simulation_results');
+        const oldDocs = await resultsRef
+            .where('strategy_code', '==', strategy_code)
+            .where('start_date', '>=', bulkStart)
+            .where('start_date', '<=', bulkEnd)
+            .get();
 
+        if (!oldDocs.empty) {
+            const deleteBatch = firestore.batch();
+            oldDocs.forEach(doc => deleteBatch.delete(doc.ref));
+            await deleteBatch.commit();
+            console.log(`[Bulk Simulation] 기존 데이터 ${oldDocs.size}건 삭제 완료`);
+        }
+
+        // 2. 시작일 리스트 추출 (Firestore ticker_prices 문서 활용)
+        const tickerDoc = await firestore.collection('ticker_prices').doc(ticker).get();
+        if (!tickerDoc.exists) {
+            return res.status(404).json({ success: false, error: "주가 데이터가 없습니다." });
+        }
+
+        const tickerData = tickerDoc.data();
+        const labels = tickerData.labels || []; // ['2025-01-01', ...]
+        
+        // 필터링된 시작일 리스트 생성
+        const startDateList = labels.filter(date => {
+            const d = date.includes('T') ? date.split('T')[0] : date;
+            return d >= bulkStart && d <= bulkEnd;
+        }).sort();
+
+        // 3. 루프 돌며 시뮬레이션 실행 및 배치 저장 준비
         let count = 0;
-        for (const row of dateRows) {
-            // [에러 해결] row.date가 객체인지 문자열인지 확인 후 처리
-            let currentStart;
-            if (row.date instanceof Date) {
-                currentStart = row.date.toISOString().split('T')[0];
-            } else {
-                // 이미 문자열(2025-01-01 형태)이라면 그대로 사용하거나 T 기준으로 자름
-                currentStart = String(row.date).split(' ')[0].split('T')[0];
-            }
+        const saveBatch = firestore.batch();
 
-            // 3. 공통 함수 호출
+        for (const currentStart of startDateList) {
+            // 공통 함수 호출 (이 함수 내부도 Firestore를 보도록 수정되어 있어야 함)
             const result = await runSimulationInternal({
                 ticker, start: currentStart, end: targetEnd,
                 initCash, initStock, targetRate, upperRate, lowerRate, unitGap
@@ -987,20 +952,44 @@ app.post('/api/bulk-simulation', async (req, res) => {
 
             if (result && result.rows.length > 0) {
                 const last = result.lastStatus;
+                
+                // Firestore 문서 ID 생성 (전략코드_시작일)
+                const docId = `${strategy_code}_${currentStart}`;
+                const docRef = resultsRef.doc(docId);
 
-                // 4. DB 저장
-                await db.query(
-                    `INSERT INTO simulation_result 
-                    (strategy_code, start_date, end_date, end_asset, end_stock_rate, max_mdd_rate, average_price, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
-                    [strategy_code, currentStart, last.date, last.asset, last.stockRatio, last.max_mdd_rate, last.avgPrice]
-                );
+                saveBatch.set(docRef, {
+                    strategy_code,
+                    ticker,
+                    start_date: currentStart,
+                    end_date: last.date,
+                    end_asset: last.asset,
+                    end_stock_rate: last.stockRatio,
+                    max_mdd_rate: last.max_mdd_rate,
+                    average_price: last.avgPrice,
+                    upperRate, // 저장 시 사용자 변수명 준수
+                    lowerRate,
+                    created_at: admin.firestore.FieldValue.serverTimestamp()
+                });
+                
                 count++;
+
+                // Firestore 배치 제한(500개) 고려 - 만약 400개가 넘으면 중간 커밋
+                if (count % 400 === 0) {
+                    await saveBatch.commit();
+                }
             }
         }
+
+        // 남은 배치 커밋
+        if (count % 400 !== 0) {
+            await saveBatch.commit();
+        }
+
+        console.log(`[Bulk Simulation] 완료: 총 ${count}건 저장`);
         res.json({ success: true, count });
+
     } catch (e) {
-        console.error(e);
+        console.error("[Bulk Simulation Error]:", e);
         res.status(500).json({ success: false, error: e.message });
     }
 });
@@ -1039,65 +1028,156 @@ async function sendCommonEmail(to, subject, html) {
     }
 }
 
-// [백엔드] 공통 메일 발송 API 추가
+// [최종 수정] 공통 메일 발송 API (컬렉션 명: users)
 app.post('/api/send-common-email', async (req, res) => {
     const { subject, html } = req.body;
+    
     try {
-        // 1. 구독자 조회
-        const [customers] = await db.query("SELECT email FROM customer_master WHERE is_subscribed = 'Y'");
-        const recipients = customers.map(c => c.email);
+        console.log(`[Mail Service] 구독자 메일 발송 시작: ${subject}`);
 
-        if (recipients.length === 0) {
+        // 1. 파이어스토어 'users' 컬렉션에서 구독 중('Y')인 사용자 조회
+        const usersRef = firestore.collection('users');
+        const snapshot = await usersRef
+            .where('is_subscribed', '==', 'Y')
+            .get();
+
+        if (snapshot.empty) {
             return res.status(400).json({ success: false, error: "수신 대상자가 없습니다." });
         }
 
-        // 2. 메일 발송 함수 호출
+        // 2. 이메일 목록 추출
+        const recipients = [];
+        snapshot.forEach(doc => {
+            const data = doc.data();
+            // 필드명이 email인지 userEmail인지 확인 필요 (일반적으로 email 사용)
+            if (data.email) {
+                recipients.push(data.email);
+            }
+        });
+
+        if (recipients.length === 0) {
+            return res.status(400).json({ success: false, error: "유효한 이메일 주소가 없습니다." });
+        }
+
+        // 3. 메일 발송 함수 호출
         await sendCommonEmail(recipients, subject, html);
         
+        console.log(`[Mail Service] 성공: ${recipients.length}명에게 발송 완료`);
         res.json({ success: true, count: recipients.length });
+
     } catch (e) {
-        console.error("Mail Send Error:", e);
+        console.error("[Mail Send Error]:", e);
         res.status(500).json({ success: false, error: e.message });
     }
 });
 
-// [API] 전략 설정과 결과를 조인하여 데이터 반환
+// [수정] 전략 설정과 결과를 통합하여 데이터 반환 (Firestore)
 app.post('/api/get-analysis-data', async (req, res) => {
     const { strategyCodes, startDate, endDate } = req.body;
-    try {
-        const [rows] = await db.query(
-            `SELECT 
-                s.strategy_code, s.ticker, s.init_cash, s.init_stock, 
-                s.target_rate, s.upper_rate, s.lower_rate, s.unit_gap,
-                r.start_date, r.end_date, r.end_asset, r.end_stock_rate, 
-                r.max_mdd_rate, r.average_price
-             FROM strategy_settings s
-             INNER JOIN simulation_result r ON s.strategy_code = r.strategy_code
-             WHERE s.strategy_code IN (?) 
-               AND r.start_date BETWEEN ? AND ?
-             ORDER BY r.start_date ASC`,
-            [strategyCodes, startDate, endDate]
-        );
 
-        // CAGR 계산 후 데이터 가공
-        const processed = rows.map(row => {
-            const start = new Date(row.start_date);
-            const end = new Date(row.end_date);
+    try {
+        console.log(`[Analysis Data] Fetching for strategies: ${strategyCodes}`);
+
+        // 1. 전략 설정(strategies) 정보 가져오기
+        // WHERE IN 쿼리는 Firestore에서 FieldPath.documentId()와 'in' 연산자로 처리 가능 (최대 30개 제한)
+        const strategiesSnapshot = await firestore.collection('strategies')
+            .where(admin.firestore.FieldPath.documentId(), 'in', strategyCodes)
+            .get();
+
+        if (strategiesSnapshot.empty) {
+            return res.json({ success: true, data: [] });
+        }
+
+        // 전략 정보를 맵(Map) 형태로 저장 (빠른 조인을 위함)
+        const strategyMap = {};
+        strategiesSnapshot.forEach(doc => {
+            strategyMap[doc.id] = doc.data();
+        });
+
+        // 2. 시뮬레이션 결과(simulation_results) 가져오기
+        const resultsRef = firestore.collection('simulation_results');
+        const resultsSnapshot = await resultsRef
+            .where('strategy_code', 'in', strategyCodes)
+            .where('start_date', '>=', startDate)
+            .where('start_date', '<=', endDate)
+            .get();
+
+        // 3. 데이터 조인 및 CAGR 계산
+        const processed = resultsSnapshot.docs.map(doc => {
+            const resultData = doc.data();
+            const strategyData = strategyMap[resultData.strategy_code] || {};
+
+            // 날짜 계산 (CAGR용)
+            const start = new Date(resultData.start_date);
+            const end = new Date(resultData.end_date);
             const diffDays = Math.max(1, (end - start) / (1000 * 60 * 60 * 24));
-            // 연복리 수익률 공식: ((기말자산/기초자산)^(365/일수) - 1) * 100
-            const cagr = (Math.pow(row.end_asset / row.init_cash, 365 / diffDays) - 1) * 100;
-            
+
+            // 연복리 수익률(CAGR) 공식 적용
+            // 기초자산(init_cash)은 전략 설정 정보에 있음
+            const initCash = strategyData.init_cash || 1; 
+            const cagr = (Math.pow(resultData.end_asset / initCash, 365 / diffDays) - 1) * 100;
+
             return {
-                ...row,
+                // 결과 데이터와 전략 설정을 하나로 합침 (MySQL JOIN 효과)
+                strategy_code: resultData.strategy_code,
+                ticker: strategyData.ticker,
+                init_cash: strategyData.init_cash,
+                init_stock: strategyData.init_stock,
+                target_rate: strategyData.target_rate,
+                upperRate: strategyData.upperRate, // 사용자 변수명 준수
+                lowerRate: strategyData.lowerRate, // 사용자 변수명 준수
+                unit_gap: strategyData.unit_gap,
+                
+                start_date: resultData.start_date,
+                end_date: resultData.end_date,
+                end_asset: resultData.end_asset,
+                end_stock_rate: resultData.end_stock_rate,
+                max_mdd_rate: resultData.max_mdd_rate,
+                average_price: resultData.average_price,
+                
                 cagr: parseFloat(cagr.toFixed(2)),
-                startDateStr: start.toISOString().split('T')[0]
+                startDateStr: resultData.start_date // 이미 YYYY-MM-DD 형태라면 그대로 사용
             };
         });
 
+        // 시작일 기준 오름차순 정렬
+        processed.sort((a, b) => a.start_date.localeCompare(b.start_date));
+
         res.json({ success: true, data: processed });
+
     } catch (e) {
+        console.error("[Analysis Data Error]:", e);
         res.status(500).json({ success: false, error: e.message });
     }
+});
+
+// [테스트] 1분마다 콘솔에 로그 찍기
+cron.schedule('* * * * *', () => {
+  console.log('--- [Cron] 1분마다 배치 작업이 실행됩니다. ---');
+});
+
+// [로컬 테스트용] 매일 새벽 6시에 실행되도록 설정
+// (분 시 일 월 요일)
+cron.schedule('30 14 * * *', async () => {
+    console.log('--- [Cron Test] 한국 시간 오후 2시 30분 배치 실행 ---');
+        
+    try {
+        // 테스트용: 나스닥 지수(^IXIC) 하나만 수집해보기
+        const ticker = '^IXIC';
+        const today = new Date().toISOString().split('T')[0];
+        
+        console.log(`[${ticker}] ${today} 데이터 수집 시도 중...`);
+        
+        // 1. 여기에 기존에 만든 주가 수집 로직(fetchWithChunks 등) 호출
+        // 2. Firestore에 set 하는 로직 실행
+        
+        console.log(`[Cron Test] 작업이 완료되었습니다.`);
+    } catch (err) {
+        console.error('배치 테스트 에러:', err);
+    }
+}, {
+    scheduled: true,
+    timezone: "Asia/Seoul" // PC가 한국 시간이니 이 설정이 정확합니다.
 });
 
 // ----------------------------------------------------------------
