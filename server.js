@@ -1152,33 +1152,33 @@ app.post('/api/get-analysis-data', async (req, res) => {
 });
 
 // [테스트] 1분마다 콘솔에 로그 찍기
-cron.schedule('* * * * *', () => {
-  console.log('--- [Cron] 1분마다 배치 작업이 실행됩니다. ---');
-});
+//cron.schedule('* * * * *', () => {
+//  console.log('--- [Cron] 1분마다 배치 작업이 실행됩니다. ---');
+//});
 
 // [로컬 테스트용] 매일 새벽 6시에 실행되도록 설정
 // (분 시 일 월 요일)
-cron.schedule('30 14 * * *', async () => {
-    console.log('--- [Cron Test] 한국 시간 오후 2시 30분 배치 실행 ---');
+//cron.schedule('30 14 * * *', async () => {
+//    console.log('--- [Cron Test] 한국 시간 오후 2시 30분 배치 실행 ---');
+//        
+//    try {
+//        // 테스트용: 나스닥 지수(^IXIC) 하나만 수집해보기
+//        const ticker = '^IXIC';
+//        const today = new Date().toISOString().split('T')[0];
         
-    try {
-        // 테스트용: 나스닥 지수(^IXIC) 하나만 수집해보기
-        const ticker = '^IXIC';
-        const today = new Date().toISOString().split('T')[0];
-        
-        console.log(`[${ticker}] ${today} 데이터 수집 시도 중...`);
+//        console.log(`[${ticker}] ${today} 데이터 수집 시도 중...`);
         
         // 1. 여기에 기존에 만든 주가 수집 로직(fetchWithChunks 등) 호출
         // 2. Firestore에 set 하는 로직 실행
         
-        console.log(`[Cron Test] 작업이 완료되었습니다.`);
-    } catch (err) {
-        console.error('배치 테스트 에러:', err);
-    }
-}, {
-    scheduled: true,
-    timezone: "Asia/Seoul" // PC가 한국 시간이니 이 설정이 정확합니다.
-});
+//        console.log(`[Cron Test] 작업이 완료되었습니다.`);
+//    } catch (err) {
+//        console.error('배치 테스트 에러:', err);
+//    }
+//}, {
+//    scheduled: true,
+//    timezone: "Asia/Seoul" // PC가 한국 시간이니 이 설정이 정확합니다.
+//});
 
 // ----------------------------------------------------------------
 // 마지막에 둬야 하는 것
