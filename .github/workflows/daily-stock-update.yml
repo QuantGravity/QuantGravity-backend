@@ -2,9 +2,9 @@ name: Daily Stock Price Update
 
 on:
   schedule:
-    # 0 21 * * * = UTC 기준 밤 9시 = 한국 시간 오전 6시 (몬테레이 오후 3시)
+    # 0 23 * * * = UTC 기준 밤 11시 = 한국 시간 오전 8시 (몬테레이 오후 5시)
     # 미국 장 마감 후 충분히 여유 있는 시간입니다.
-    - cron: '0 21 * * *'
+    - cron: '0 23 * * *'
   workflow_dispatch: # 수동으로 실행 버튼을 누를 수 있게 해주는 기능
 
 jobs:
@@ -15,6 +15,4 @@ jobs:
         run: |
           curl -X POST "https://quant-navigator-backend.onrender.com/api/update-prices" \
           -H "Content-Type: application/json" \
-          -d '{
-            "tickers": ["TQQQ", "QLD", "^IXIC", "^GSPC"]
-          }'
+          -d '{}'
