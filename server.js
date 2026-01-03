@@ -12,9 +12,12 @@ const port = process.env.PORT || 3000;
 // [추가] CORS 설정: 프론트엔드 호스트 허용
 app.use(cors({
     origin: [
-        'http://localhost:3000',
+        'http://localhost:3000',      // React 기본 포트
         'http://127.0.0.1:3000',
-        'https://quant-navigator-backend.onrender.com' // 본인의 Render 주소
+        'http://localhost:10000',     // Render 로그에 찍힌 백엔드 포트 (로컬 테스트용)
+        'http://127.0.0.1:10000',
+        'https://quant-navigator.web.app', // [중요] 실제 서비스 중인 Firebase 프론트엔드 주소
+        'https://quant-navigator-backend.onrender.com'
     ],
     credentials: true
 }));
