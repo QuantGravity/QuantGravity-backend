@@ -85,6 +85,14 @@ const nodemailer = require('nodemailer');
 
 console.log("Firebase Admin SDK가 성공적으로 연결되었습니다.");
 
+// [공통 함수] 관리자 권한 체크 로직
+async function verifyAdmin(adminEmail) {
+    if (!adminEmail) return false;
+    const adminDoc = await db.collection('users').doc(adminEmail).get();
+    if (!adminDoc.exists) return false;
+    return adminDoc.data().role === 'G9'; // 등급이 G9인지 확인
+}
+
 // 사용자 인증 확인을 위한 미들웨어 함수
 const verifyToken = async (req, res, next) => {
     const idToken = req.headers.authorization?.split('Bearer ')[1];
@@ -161,9 +169,6 @@ app.delete('/api/delete-from-firestore', async (req, res) => {
         if (!collectionName || !id) {
             return res.status(400).json({ error: "컬렉션 이름과 문서 ID는 필수입니다." });
         }
-
-        // [보안] 관리자 권한 체크 로직을 여기에 추가할 수 있습니다.
-        // 예: if (req.headers['x-admin-role'] !== 'admin') return res.status(403)...
 
         console.log(`[Firestore Delete] ${collectionName}/${id}`);
 
@@ -436,7 +441,7 @@ async function fetchWithChunks(ticker, start, end) {
     return chunks;
 }
 
-app.post('/api/update-prices', async (req, res) => {
+app.post('/                                                                                                                                                                                                                                                                                                             ', async (req, res) => {
     try {
         const { startDate, endDate, tickers } = req.body; 
         
