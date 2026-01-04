@@ -441,7 +441,7 @@ async function fetchWithChunks(ticker, start, end) {
     return chunks;
 }
 
-app.post('/                                                                                                                                                                                                                                                                                                             ', async (req, res) => {
+app.post('/api/update-prices', async (req, res) => {
     try {
         const { startDate, endDate, tickers } = req.body; 
         
