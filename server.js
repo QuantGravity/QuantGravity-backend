@@ -14,6 +14,7 @@ app.use(cors({
     origin: [
         'http://localhost:3000',      // React 기본 포트
         'http://127.0.0.1:3000',
+        'http://localhost:5500',      
         'http://localhost:10000',     // Render 로그에 찍힌 백엔드 포트 (로컬 테스트용)
         'http://127.0.0.1:10000',
         'https://quant-navigator.web.app', // [중요] 실제 서비스 중인 Firebase 프론트엔드 주소
@@ -121,43 +122,55 @@ app.post('/api/upload-to-firestore', async (req, res) => {
             return res.status(400).json({ error: "컬렉션 이름과 데이터는 필수입니다." });
         }
 
-        // 1. 실제 바이트(Byte) 용량 계산 (UTF-8 기준)
+        // 1. 데이터 가공: "SERVER_TIMESTAMP" 문자열을 실제 Firebase 서버 시간 객체로 변환
+        const finalData = { ...data };
+        Object.keys(finalData).forEach(key => {
+            if (finalData[key] === "SERVER_TIMESTAMP") {
+                finalData[key] = admin.firestore.FieldValue.serverTimestamp();
+            }
+        });
+
+        // 2. 용량 계산용 JSON 문자열 생성 (정의되지 않은 finaldata 대신 data 사용)
         const jsonString = JSON.stringify(data);
         const byteSize = Buffer.byteLength(jsonString, 'utf8');
         const kbSize = (byteSize / 1024).toFixed(2);
 
-        // 2. 터미널 로그 출력 (용량 확인용)
+        // 3. 터미널 로그 출력
         console.log(`--------------------------------------------------`);
         console.log(`[Firestore Upload Log]`);
         console.log(`- 경로: ${collectionName}/${docId || 'auto-gen'}`);
         console.log(`- 용량: ${byteSize} bytes (${kbSize} KB)`);
-        console.log(`- 데이터 개수: ${data.values ? data.values.length : 'N/A'} rows`);
         console.log(`--------------------------------------------------`);
 
-        if (jsonString.length > 1048487) {
+        // 4. Firestore 용량 제한 체크 (1MB)
+        if (byteSize > 1048487) {
             return res.status(413).json({ error: "Firestore 단일 문서 용량 제한(1MB)을 초과했습니다." });
         }
 
-        // 변수명 확인: firestoree 인지 firestore 인지 확인 필요
+        // 5. DB 작업 (질문자님이 선언하신 'firestore' 변수 사용)
         const colRef = firestore.collection(collectionName);
         
         if (docId) {
+            // 기존 문서 업데이트 (merge: true)
             await colRef.doc(docId).set({
-                ...data,
+                ...finalData,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
             }, { merge: true });
-            // 응답 키값을 docId로 통일
+            
             res.status(200).json({ success: true, docId: docId });
         } else {
+            // 신규 문서 생성
             const docRef = await colRef.add({
-                ...data,
+                ...finalData,
                 createdAt: admin.firestore.FieldValue.serverTimestamp(),
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
             });
             res.status(200).json({ success: true, docId: docRef.id });
         }
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        // catch 블록의 변수명을 error로 통일하여 참조 에러 방지
+        console.error("[Firestore Update Error]:", error);
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
