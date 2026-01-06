@@ -76,7 +76,8 @@ const serviceAccount = {
 // Firebase Admin SDK 초기화
 if (!admin.apps.length) {
     admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
+        credential: admin.credential.cert(serviceAccount),
+        ignoreUndefinedProperties: true, // undefined 필드는 무시하고 저장/쿼리함
     });
 }
 
