@@ -295,23 +295,29 @@ async function getDailyStockData(ticker, start, end) {
 
         const data = doc.data();
         const labels = data.labels || [];
-        const values = data.values || [];
+        const prices = data.prices || []; // values 대신 prices 사용
 
         // 데이터를 객체 배열 포맷으로 변환 및 필터링
         const rows = labels.map((date, index) => {
             const dDate = date.includes('T') ? date.split('T')[0] : date;
+            const p = prices[index]; // 해당 날짜의 가격 객체 {o, h, l, c}
+
             return {
                 date: dDate,
-                close_price: values[index],
-                open_price: values[index], // 종가로 대체
-                high_price: values[index],
-                low_price: values[index]
+                // DB에 저장된 소수점 4자리 데이터를 그대로 가져옴
+                // 만약 구형 데이터(단일 숫자)가 섞여있을 경우를 대비해 예외처리 포함
+                close_price: p && typeof p === 'object' ? p.c : p, 
+                open_price:  p && typeof p === 'object' ? p.o : p,
+                high_price:  p && typeof p === 'object' ? p.h : p,
+                low_price:   p && typeof p === 'object' ? p.l : p
             };
         }).filter(row => {
+            // 날짜 범위 필터링
             if (start && end) return row.date >= start && row.date <= end;
             return true;
         });
 
+        // 날짜 기준 오름차순 정렬
         return rows.sort((a, b) => a.date.localeCompare(b.date));
     } catch (err) {
         console.error(`Firestore 조회 에러 (${ticker}):`, err.message);
@@ -322,44 +328,48 @@ async function getDailyStockData(ticker, start, end) {
 // [백엔드 수정] 권한에 따라 로컬 DB 또는 Firestore에서 데이터를 조회하는 표준 API
 // [백엔드] 권한 기반 통합 주가 조회 API
 app.get('/api/stocks-bulk', async (req, res) => {
-    // mode 파라미터 추가 수신
     const { tickers, start, end } = req.query; 
     if (!tickers) return res.status(400).json({ error: "티커 코드가 없습니다." });
 
     const tickerList = tickers.split(',');
 
     try {
-            const bulkResults = [];
+        const bulkResults = [];
+        
+        // 병렬 처리를 통해 여러 티커 데이터를 Firestore에서 가져옴
+        await Promise.all(tickerList.map(async (ticker) => {
+            const doc = await firestore.collection('ticker_prices').doc(ticker).get();
             
-            // 병렬 처리를 통해 여러 티커 데이터를 Firestore에서 가져옴
-            await Promise.all(tickerList.map(async (ticker) => {
-                const doc = await firestore.collection('ticker_prices').doc(ticker).get();
-                
-                if (doc.exists) {
-                    const data = doc.data();
-                    const labels = data.labels || [];
-                    const values = data.values || [];
+            if (doc.exists) {
+                const data = doc.data();
+                const labels = data.labels || [];
+                const prices = data.prices || []; // [수정] values -> prices
 
-                    // Firestore 배열 구조를 [{ticker, date, close_price}, ...] 형식으로 변환
-                    labels.forEach((date, index) => {
-                        const dDate = date.includes('T') ? date.split('T')[0] : date;
-                        // 요청된 기간 필터링
-                        if (dDate >= start && dDate <= end) {
-                            bulkResults.push({
-                                ticker: ticker,
-                                date: dDate,
-                                close_price: values[index]
-                            });
-                        }
-                    });
-                }
-            }));
+                labels.forEach((date, index) => {
+                    const dDate = date.includes('T') ? date.split('T')[0] : date;
+                    
+                    // 요청된 기간 필터링
+                    if (dDate >= start && dDate <= end) {
+                        const p = prices[index];
+                        
+                        // [수정] 객체 구조 대응: p.c(종가) 사용
+                        // 소수점 4자리는 DB에 이미 반영되어 있으므로 그대로 사용됩니다.
+                        const closePrice = p && typeof p === 'object' ? p.c : p;
 
-            // 날짜 기준 오름차순 정렬 (차트 렌더링용)
-            bulkResults.sort((a, b) => a.date.localeCompare(b.date));
-            return res.json(bulkResults);
-        }
-    catch (err) {
+                        bulkResults.push({
+                            ticker: ticker,
+                            date: dDate,
+                            close_price: closePrice
+                        });
+                    }
+                });
+            }
+        }));
+
+        // 날짜 기준 오름차순 정렬
+        bulkResults.sort((a, b) => a.date.localeCompare(b.date));
+        return res.json(bulkResults);
+    } catch (err) {
         console.error(`Bulk fetch error:`, err.message);
         res.status(500).json({ error: "주가 데이터를 불러오는 중 오류가 발생했습니다." });
     }
@@ -498,22 +508,31 @@ app.post('/api/update-prices', async (req, res) => {
                     // --- 1. Firestore 형식으로 데이터 가공 ---
                     // 날짜(labels)와 종가(values) 배열 생성
                     const labels = [];
-                    const values = [];
+                    const priceData = []; // values 대신 더 명확한 이름 사용
 
                     for (const quote of history) {
-                        if (!quote.date || !quote.close || quote.close === 0) continue;
+                        if (!quote.date || !quote.close) continue;
                         
                         const quoteDate = new Date(quote.date).toISOString().split('T')[0];
                         labels.push(quoteDate);
-                        values.push(quote.close);
+
+                        // 소수점 4자리 버림 처리를 적용한 객체 생성
+                        const truncate = (val) => Math.floor(val * 10000) / 10000;
+
+                        priceData.push({
+                            o: truncate(quote.open || quote.close), // 시가 (없으면 종가로 대체)
+                            h: truncate(quote.high || quote.close), // 고가
+                            l: truncate(quote.low || quote.close),  // 저가
+                            c: truncate(quote.close)                // 종가
+                        });
                     }
 
-                    // --- 2. Firestore 업로드 실행 (백엔드 내부 함수 직접 호출과 유사) ---
+                    // 업로드 페이로드 수정
                     const uploadPayload = {
                         ticker: ticker,
                         last_updated: new Date().toISOString(),
-                        labels: labels, // 날짜 배열
-                        values: values  // 종가 배열
+                        labels: labels,
+                        prices: priceData // 객체 배열로 저장
                     };
 
                     const collectionName = "ticker_prices";
@@ -851,12 +870,18 @@ async function runSimulationInternal(params) {
         // ----------------------------------------------------------------
         // [매도(Sell) 12단계 로직]
         // ----------------------------------------------------------------
+        // 현재 시점의 평단가 계산 (매도 시 세금 계산용)
+        const currentAvgPrice = prevShares > 0 ? totalPurchaseAmt / prevShares : 0;
+
         let sOpenReq = (prevShares * open > prevUpper * (1 + unitGapPct)) ? (prevShares * open - prevUpper) : 0;
         
         let sOpenCount = (sOpenReq > 0 && prevShares > 0) ? Math.floor(nper_custom(unitGapPct, prevUpper / prevShares, -open)) : 0;
         let sOpenPrice = sOpenCount > 0 ? open : 0;
         let sOpenQty = sOpenCount * unitShares;
-        let sOpenAmt = sOpenQty * sOpenPrice; // 매도는 현금 유입이므로 세금/수수료 생략(혹은 별도처리)
+
+        let sOpenProfit = sOpenQty * (sOpenPrice - currentAvgPrice); // 매도 수익
+        let sOpenTax = sOpenProfit > 0 ? sOpenProfit * 0.22 : 0;     // 수익의 22% 세금
+        let sOpenAmt = (sOpenQty * sOpenPrice) * 0.9993 - sOpenTax;           // 세후 현금 유입
 
         let sHighReq = (prevShares * high > prevUpper * (1 + unitGapPct)) ? (prevShares * high - prevUpper - sOpenReq) : 0;
         
@@ -867,7 +892,12 @@ async function runSimulationInternal(params) {
         let sHighLast = sHighCount > 0 ? (prevUpper / prevShares) * Math.pow(1 + unitGapPct, sOpenCount + sHighCount) : 0;
         let sHighAvg = sHighFirst > 0 ? (sHighFirst + sHighLast) / 2 : 0;
         let sHighQty = sHighCount * unitShares;
-        let sHighAmt = sHighQty * sHighAvg;
+
+        // [수정] 고가 매도 시 양도세 계산
+        let sHighProfit = sHighQty * (sHighAvg - currentAvgPrice);   // 매도 수익
+        let sHighTax = sHighProfit > 0 ? sHighProfit * 0.22 : 0;     // 수익의 22% 세금
+        let sHighAmt = (sHighQty * sHighAvg) - sHighTax;             // 세후 현금 유입
+
         let sAmt = sOpenAmt + sHighAmt;
       
         // 실제 자산 반영
