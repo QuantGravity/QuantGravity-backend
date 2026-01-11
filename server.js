@@ -682,61 +682,6 @@ app.get('/api/daily-stock', async (req, res) => {
     }
 });
 
-// ----------------------------------------------------------------
-// [수정] 전략(Strategy) 관리 API (Firestore로 전환)
-// ----------------------------------------------------------------
-app.get('/api/strategies', async (req, res) => {
-    try {
-        const snapshot = await firestore.collection('strategies').get();
-        const list = snapshot.docs.map(doc => ({ strategy_code: doc.id, ...doc.data() }));
-        res.json(list);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.post('/api/strategies', async (req, res) => {
-    try {
-        const { strategy_code, ...rest } = req.body;
-        // upperRate, lowerRate 변수명 사용 준수
-        await firestore.collection('strategies').doc(strategy_code).set({
-            ...rest,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// [수정] 전략 단일 삭제 API
-app.delete('/api/strategies/:strategy_code', async (req, res) => {
-    try {
-        const { strategy_code } = req.params;
-
-        if (!strategy_code) {
-            return res.status(400).json({ error: "전략 코드가 필요합니다." });
-        }
-
-        console.log(`[Firestore Delete] Strategy: ${strategy_code}`);
-
-        // 1. 해당 전략 문서 삭제
-        await firestore.collection('strategies').doc(strategy_code).delete();
-
-        // 2. (선택 사항) 해당 전략과 연결된 시뮬레이션 결과들도 함께 삭제하고 싶다면 아래 로직 추가
-        const resultsRef = firestore.collection('simulation_results');
-        const batch = firestore.batch();
-        const snapshot = await resultsRef.where('strategy_code', '==', strategy_code).get();
-        snapshot.forEach(doc => batch.delete(doc.ref));
-        await batch.commit();
-
-        res.status(200).json({ success: true, message: "전략이 성공적으로 삭제되었습니다." });
-    } catch (e) {
-        console.error("Strategy Delete Error:", e);
-        res.status(500).json({ error: e.message });
-    }
-});
-
 // [수정] API 엔드포인트 부분
 app.get('/api/simulation-summary', async (req, res) => {
     try {
@@ -1202,6 +1147,35 @@ app.post('/api/get-analysis-data', async (req, res) => {
     } catch (e) {
         console.error("[Analysis Data Error]:", e);
         res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/**
+ * [추가] 야후 파이낸스 티커 정보 조회 API (프록시)
+ * 프론트엔드에서 티커 유효성 검사 및 자동 명칭 완성을 위해 호출함
+ */
+app.get('/api/proxy/yahoo-info', async (req, res) => {
+    const { ticker } = req.query;
+    if (!ticker) return res.status(400).json({ error: "티커 코드가 필요합니다." });
+
+    try {
+        const cleanTicker = ticker.trim().toUpperCase();
+        // quote는 단일 객체를 반환하지만, 에러 방지를 위해 방어적으로 처리
+        const result = await yahooFinance.quote(cleanTicker);
+
+        if (result && result.shortName) {
+            res.json({
+                symbol: result.symbol,
+                shortName: result.shortName || result.longName || "명칭 없음",
+                price: result.regularMarketPrice
+            });
+        } else {
+            res.status(404).json({ error: "Not Found" });
+        }
+    } catch (error) {
+        console.error(`[Yahoo Proxy Error] ${ticker}:`, error.message);
+        // 야후 API가 에러를 던지면 티커가 없는 것으로 간주하여 404 반환
+        res.status(404).json({ error: "유효하지 않은 티커입니다." });
     }
 });
 
