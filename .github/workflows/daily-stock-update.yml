@@ -2,17 +2,27 @@ name: Daily Stock Price Update
 
 on:
   schedule:
-    # 0 23 * * * = UTC 기준 밤 11시 = 한국 시간 오전 8시 (몬테레이 오후 5시)
-    # 미국 장 마감 후 충분히 여유 있는 시간입니다.
+    # 0 23 * * * = UTC 기준 밤 11시 = 한국 시간 오전 8시
     - cron: '0 23 * * *'
-  workflow_dispatch: # 수동으로 실행 버튼을 누를 수 있게 해주는 기능
+  workflow_dispatch:
 
 jobs:
   update-stock:
     runs-on: ubuntu-latest
     steps:
-      - name: Send Update Request to Backend
+      - name: Send Update Request and Analyze
         run: |
+          # 1. 주가 데이터 최신화
+          echo "Updating Stock Prices..."
           curl -X POST "https://quant-navigator-backend.onrender.com/api/update-prices" \
+          -H "Content-Type: application/json" \
+          -d '{}'
+
+          # 약간의 대기 (서버 부하 방지용, 선택 사항)
+          sleep 10
+
+          # 2. 지수 데이터 분석 및 캐싱 실행 (새로 만든 API)
+          echo "Analyzing Indices..."
+          curl -X POST "https://quant-navigator-backend.onrender.com/api/batch/analyze-indices" \
           -H "Content-Type: application/json" \
           -d '{}'
