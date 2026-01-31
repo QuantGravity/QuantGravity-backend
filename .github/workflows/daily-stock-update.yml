@@ -21,8 +21,8 @@ jobs:
           # 약간의 대기 (서버 부하 방지용, 선택 사항)
           sleep 10
 
-          # 2. 지수 데이터 분석 및 캐싱 실행 (새로 만든 API)
-          echo "Analyzing Indices..."
-          curl -X POST "https://quant-navigator-backend.onrender.com/api/batch/analyze-indices" \
+          # 2. 전체 종목 분석 및 스냅샷 생성
+          echo "Analyzing All Tickers..."
+          curl -X POST "https://quant-navigator-backend.onrender.com/api/batch/analyze-all-tickers" \
           -H "Content-Type: application/json" \
           -d '{}'
