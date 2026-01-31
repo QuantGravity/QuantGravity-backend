@@ -3,11 +3,101 @@ const express = require('express');
 const path = require('path');
 const cors = require('cors'); // 추가
 const cron = require('node-cron');
+const fmpClient = require('./utils/fmpClient');
+const YahooFinance = require('yahoo-finance2').default;
 
 require('dotenv').config();
+// firebase 연결    ----------------------------------  최 상단에 둬야 함 - 시작
+const admin = require('firebase-admin');
+const serviceAccount = {
+  projectId: process.env.FIREBASE_PROJECT_ID,
+  clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+  // \n 문자 처리를 위해 아래와 같이 작성합니다.
+  privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+};
+
+// Firebase Admin SDK 초기화
+if (!admin.apps.length) {
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        ignoreUndefinedProperties: true, // undefined 필드는 무시하고 저장/쿼리함
+    });
+}
+
+const firestore = admin.firestore();
+
+const nodemailer = require('nodemailer');
+
+console.log("Firebase Admin SDK가 성공적으로 연결되었습니다.");
+
+// firebase 연결    ----------------------------------  최 상단에 둬야 함 - 끝
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+// // [추가] 보안 모듈 가져오기 - server.js 상단 
+const { generateToken, verifyToken } = require('./auth');
+const { logTraffic } = require('./logger'); // [추가] 로거 가져오기
+
+// ============================================================
+// 각 컬렉션 별로 사용자권한 점검 - 수작업으로 관리해줘야 함.
+// ============================================================
+const COLLECTION_RULES = {
+    // 1. [관리자 영역] 티커, 주가정보 등은 관리자나 G9만 수정 가능
+    'tickers': (user, docId, data) => ['admin', 'G9'].includes(user.role),
+    'ticker_prices': (user, docId, data) => ['admin'].includes(user.role),
+    'notices': (user, docId, data) => ['admin'].includes(user.role),
+    // [추가] 메뉴 설정도 관리자만 수정 가능
+    'menu_settings': (user, docId, data) => ['admin'].includes(user.role), 
+
+    // 2. [개인 데이터 영역] 내 문서는 '나(docId)'만 수정 가능
+    'user_strategies': (user, docId, data) => user.email === docId,
+    'investment_tickers': (user, docId, data) => user.email === docId, 
+    
+    // ▼▼▼ [누락된 항목 추가] ▼▼▼
+    'favorite_groups': (user, docId, data) => user.email === docId,     // 관심종목 그룹
+    'favorite_tickers': (user, docId, data) => user.email === docId,    // 관심종목 상세
+    'user_analysis_jobs': (user, docId, data) => user.email === docId,  // [중요] 작업번호 관리
+    // [추가] 고객 문의 권한 설정
+    'customer_inquiries': (user, docId, data) => {
+        // 관리자나 G9 등급은 모든 권한 허용
+        if (['admin', 'G9'].includes(user.role)) return true;
+        
+        // 일반 사용자는 본인이 작성한 문서(userId가 본인 이메일)인 경우에만 허용
+        if (data && data.userId === user.email) return true;
+        
+        // 상세 조회 시 docId가 user.email과 연관이 없으므로, 
+        // 리스트 조회나 신규 등록 시에는 기본적으로 true를 반환하고 세부 필터링은 API에서 처리
+        return true; 
+    },
+    // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+    // 3. [위험 구역] 회원 정보는 공통 API로 수정 금지
+    // [보강] 사용자 정보 조회 권한
+    'users': (user, docId, data) => {
+        // 관리자라면 모든 유저 정보 조회 가능
+        if (['admin', 'G9'].includes(user.role)) return true;
+        // 일반 유저는 본인 정보만 조회 가능
+        return user.email === docId;
+    },
+
+    // 4. [시스템 영역] 로그 등은 API로 임의 수정 절대 불가
+    'traffic_logs': (user, docId, data) => false,
+    'limit_logs': (user, docId, data) => false
+};
+
+// 1. [공개 구역] 인증 없이 접근 가능한 API들 (순서 중요! 맨 위에 배치)
+
+
+
+// ============================================================
+// 2. [검문소 설치] 이 아래에 있는 모든 API는 자동으로 verifyToken이 적용됨
+// ============================================================
+
+
+// 3. [보안 구역] 여기부터는 verifyToken을 일일이 안 써도 됨!
+// 이미 2번에서 걸러졌기 때문.
+
 
 // [추가] CORS 설정: 프론트엔드 호스트 허용
 app.use(cors({
@@ -33,8 +123,6 @@ app.use(express.urlencoded({
     limit: '50mb',
     extended: true
 }));
-
-const YahooFinance = require('yahoo-finance2').default;
 
 // server.js 상단, YahooFinance 생성 부분 수정
 const customFetch = async (url, options = {}) => {
@@ -64,58 +152,131 @@ const customFetch = async (url, options = {}) => {
 // 인스턴스 생성 시 커스텀 fetch 전달
 const yahooFinance = new YahooFinance({ fetch: customFetch });
 
-// firebase 연결    ---------  최 상단에 둬야 함 - 시작
-const admin = require('firebase-admin');
-const serviceAccount = {
-  projectId: process.env.FIREBASE_PROJECT_ID,
-  clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-  // \n 문자 처리를 위해 아래와 같이 작성합니다.
-  privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
-};
 
-// Firebase Admin SDK 초기화
-if (!admin.apps.length) {
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        ignoreUndefinedProperties: true, // undefined 필드는 무시하고 저장/쿼리함
-    });
-}
 
-const firestore = admin.firestore();
-
-const nodemailer = require('nodemailer');
-
-console.log("Firebase Admin SDK가 성공적으로 연결되었습니다.");
-
-// [공통 함수] 관리자 권한 체크 로직
-async function verifyAdmin(adminEmail) {
-    if (!adminEmail) return false;
-    const adminDoc = await db.collection('users').doc(adminEmail).get();
-    if (!adminDoc.exists) return false;
-    return adminDoc.data().role === 'G9'; // 등급이 G9인지 확인
-}
-
-// 사용자 인증 확인을 위한 미들웨어 함수
-const verifyToken = async (req, res, next) => {
-    const idToken = req.headers.authorization?.split('Bearer ')[1];
-
-    if (!idToken) {
-        return res.status(401).json({ error: "로그인이 필요합니다." });
+// [추가] null 값을 파이어스토어 삭제 명령(FieldValue.delete())으로 변환하는 재귀 함수
+function convertNullToDelete(obj) {
+    for (const key in obj) {
+        if (obj[key] === null) {
+            // 값이 null이면 삭제 명령(FieldValue.delete())으로 교체
+            obj[key] = admin.firestore.FieldValue.delete();
+        } else if (typeof obj[key] === 'object' && obj[key] !== null) {
+            // 객체 안에 또 객체가 있으면 안쪽까지 검사 (재귀 호출)
+            convertNullToDelete(obj[key]);
+        }
     }
+    return obj;
+}
+
+// 1. 로그인 처리 API (판사 역할: 백앤드)
+app.post('/api/login', async (req, res) => {
+    const { token, provider } = req.body; // 프론트에서 보낸 구글/네이버 토큰
+
+    let email = "";
+    let uid = "";
 
     try {
-        const decodedToken = await admin.auth().verifyIdToken(idToken);
-        req.user = decodedToken; // 인증된 사용자 정보(uid 등)를 요청 객체에 담음
-        next();
+        // [구글 로그인 검증]
+        if (provider === 'GOOGLE') {
+            const decodedToken = await admin.auth().verifyIdToken(token);
+            email = decodedToken.email;
+            uid = decodedToken.uid;
+        } 
+        // [네이버 로그인 검증] (일단 이메일 신뢰 방식으로 약식 구현, 추후 네이버 API 검증 추가 권장)
+        else if (provider === 'NAVER') {
+            email = req.body.email; // 프론트에서 받은 이메일 사용
+            uid = email; // 네이버는 이메일을 ID처럼 사용
+        }
+
+        // 1. DB에서 유저 조회
+        const userDoc = await firestore.collection('users').doc(email).get();
+
+        // 2. 유저가 없으면 -> "회원가입 필요" 응답
+        if (!userDoc.exists) {
+            return res.json({ 
+                status: 'NEED_REGISTER', 
+                email: email,
+                provider: provider
+            });
+        }
+
+        // 3. 유저가 있으면 -> 정보 가져와서 JWT 발급 (여기가 핵심 보안)
+        const userData = userDoc.data();
+        
+        // (멤버십 만료 체크 로직 등도 여기서 수행)
+        let role = userData.role || 'G1';
+        
+        // [보안] 백앤드 전용 인증키(JWT) 발급 (auth.js의 함수 사용)
+        const systemToken = generateToken({ 
+            uid: uid, 
+            email: email, 
+            role: role 
+        });
+
+        // 4. 프론트로 결과 전송
+        res.json({ 
+            status: 'SUCCESS',
+            token: systemToken, // 이제 이 토큰 없이는 아무것도 못함
+            user: { 
+                email: email, 
+                displayName: userData.name, 
+                role: role 
+            }
+        });
+
     } catch (error) {
-        console.error("토큰 검증 에러:", error);
-        res.status(403).json({ error: "유효하지 않은 토큰입니다." });
+        console.error("Login Error:", error);
+        res.status(401).json({ error: "인증 실패" });
     }
-};
-// firebase 연결    ---------  최 상단에 둬야 함 - 끝
+});
+
+// 2. 회원가입 처리 API (DB 쓰기 권한을 백앤드만 가짐)
+app.post('/api/register', async (req, res) => {
+    try {
+        const { email, name, phone, country, gender, birthyear, provider } = req.body;
+
+        // 필수값 검증 (백앤드에서 한 번 더 체크)
+        if (!email || !name) return res.status(400).json({ error: "필수 정보 누락" });
+
+        const newUser = {
+            email,
+            name,
+            phone,
+            country,
+            gender,
+            birthyear,
+            role: 'G1', // 신규 가입은 무조건 G1 고정 (해킹 방지)
+            membershipLevel: 'FREE',
+            status: 'ACTIVE',
+            provider: provider || 'SOCIAL',
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            lastLogin: admin.firestore.FieldValue.serverTimestamp()
+        };
+
+        // DB 저장
+        await firestore.collection('users').doc(email).set(newUser);
+
+        // 가입 완료 후 바로 로그인 처리 토큰 발급
+        const systemToken = generateToken({ 
+            uid: email, 
+            email: email, 
+            role: 'G1' 
+        });
+
+        res.json({ 
+            success: true, 
+            token: systemToken,
+            user: { email, displayName: name, role: 'G1' }
+        });
+
+    } catch (error) {
+        console.error("Register Error:", error);
+        res.status(500).json({ error: "회원가입 처리 실패" });
+    }
+});
 
 // 백엔드 API 예시: /api/firestore/upload
-app.post('/api/upload-to-firestore', async (req, res) => {
+app.post('/api/upload-to-firestore', verifyToken, async (req, res) => {
     try {
         const { collectionName, docId, data } = req.body;
 
@@ -129,7 +290,17 @@ app.post('/api/upload-to-firestore', async (req, res) => {
             if (finalData[key] === "SERVER_TIMESTAMP") {
                 finalData[key] = admin.firestore.FieldValue.serverTimestamp();
             }
+            // [추가] 필드 삭제 처리
+            if (finalData[key] === "DELETE_FIELD") {
+                finalData[key] = admin.firestore.FieldValue.delete();
+            }
         });
+
+        // ============================================================
+        // [추가된 코드 2] 위에서 만든 재귀 함수 실행
+        // finalData 안에 있는 모든 중첩된 null 값을 찾아서 삭제 명령으로 바꿉니다.
+        // ============================================================
+        convertNullToDelete(finalData);
 
         // 2. 용량 계산용 JSON 문자열 생성 (정의되지 않은 finaldata 대신 data 사용)
         const jsonString = JSON.stringify(data);
@@ -176,7 +347,7 @@ app.post('/api/upload-to-firestore', async (req, res) => {
 });
 
 // [공통] 특정 컬렉션의 문서 삭제
-app.delete('/api/delete-from-firestore', async (req, res) => {
+app.delete('/api/delete-from-firestore', verifyToken, async (req, res) => {
     try {
         const { collectionName, id } = req.query; // 프론트엔드 호출 규격에 맞춰 id로 받음
 
@@ -196,24 +367,36 @@ app.delete('/api/delete-from-firestore', async (req, res) => {
 });
 
 // [백엔드] 수정된 리스트 조회 API
-app.get('/api/firestore/list/:collectionName', async (req, res) => {
+app.get('/api/firestore/list/:collectionName', verifyToken, async (req, res) => {
     try {
         const { collectionName } = req.params;
-        // updatedAt 필드가 없는 이전 데이터를 고려하여 정렬 조건은 선택적으로 적용하거나 제거할 수 있습니다.
-        const snapshot = await firestore.collection(collectionName).get();
-
-        if (snapshot.empty) {
-            return res.json([]);
+        
+        // 보안 로직 (기존 유지)
+        if (collectionName === 'users') {
+            if (!['admin', 'G9'].includes(req.user?.role)) {
+                return res.status(403).json({ error: "권한 없음" });
+            }
         }
+
+        const snapshot = await firestore.collection(collectionName).get();
+        if (snapshot.empty) return res.json([]);
 
         const list = snapshot.docs.map(doc => {
             const fullData = doc.data();
             
-            // [핵심 수정] metadata 필드가 있으면 그것을 사용하고, 없으면 전체 데이터를 사용
-            const dataContent = fullData.metadata ? fullData.metadata : fullData;
-            
+            // [중요 로직 유지] metadata 필드가 있으면 그것을 사용하고, 없으면 전체 데이터를 사용
+            let dataContent = fullData.metadata ? { ...fullData.metadata } : { ...fullData };
+
+            // [날짜 변환 추가] 데이터 안의 Timestamp 객체를 문자열로 변환 (에러 방지 핵심)
+            if (dataContent.createdAt && typeof dataContent.createdAt.toDate === 'function') {
+                dataContent.createdAt = dataContent.createdAt.toDate().toISOString();
+            }
+            if (dataContent.updatedAt && typeof dataContent.updatedAt.toDate === 'function') {
+                dataContent.updatedAt = dataContent.updatedAt.toDate().toISOString();
+            }
+
             return {
-                id: doc.id,
+                id: doc.id, // 문서 ID 포함
                 ...dataContent 
             };
         });
@@ -226,18 +409,30 @@ app.get('/api/firestore/list/:collectionName', async (req, res) => {
 });
 
 // [공통] 특정 컬렉션의 상세 문서 가져오기 (전체 데이터)
-app.get('/api/firestore/detail/:collectionName/:docId', async (req, res) => {
+// [server.js] 상세 조회 API 수정 (디버깅 로그 추가)
+app.get('/api/firestore/detail/:collectionName/:docId', verifyToken, async (req, res) => {
     try {
         const { collectionName, docId } = req.params;
+        
+        // [1] 요청 로그 출력 (서버 콘솔 확인용)
+        console.log(`========================================`);
+        console.log(`[DEBUG] 상세 조회 요청: ${collectionName} / ${docId}`);
+
         const doc = await firestore.collection(collectionName).doc(docId).get();
 
+        // [2] 데이터 존재 여부 로그
+        console.log(`[DEBUG] Firestore 존재 여부: ${doc.exists}`);
+
         if (!doc.exists) {
+            console.log(`[DEBUG] ❌ 문서가 없어 404 반환`);
             return res.status(404).json({ error: "데이터를 찾을 수 없습니다." });
         }
 
+        console.log(`[DEBUG] ✅ 데이터 반환 성공`);
         res.json(doc.data());
+
     } catch (error) {
-        console.error("Detail Fetch Error:", error);
+        console.error("[Detail Fetch Error]:", error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -245,39 +440,432 @@ app.get('/api/firestore/detail/:collectionName/:docId', async (req, res) => {
 // 관리자 이메일 목록 (본인의 이메일을 넣으세요)
 const ADMIN_EMAILS = ['your-email@gmail.com', 'partner-email@gmail.com'];
 
-app.post('/api/auth/google', async (req, res) => {
-    const { token } = req.body;
+// [백엔드] app.js 또는 라우터에 추가해야 할 코드
+// 필요한 라이브러리: mathjs (중앙값 계산용) 또는 직접 구현 가능
+// npm install mathjs (선택사항, 아래는 내장 함수로 구현함)
+
+const calculateCAGR = (startPrice, endPrice, years) => {
+    if (years <= 0 || startPrice <= 0 || endPrice <= 0) return 0;
+    return (Math.pow(endPrice / startPrice, 1 / years) - 1) * 100;
+};
+
+const getMedian = (values) => {
+    if (values.length === 0) return 0;
+    values.sort((a, b) => a - b);
+    const half = Math.floor(values.length / 2);
+    if (values.length % 2) return values[half];
+    return (values[half - 1] + values[half]) / 2.0;
+};
+// [server.js] 기존 calculateCAGR, getMedian 함수는 그대로 유지
+
+// ============================================================
+// [리팩토링] 분석 핵심 로직을 내부 함수로 분리 (재사용 목적)
+// ============================================================
+async function performAnalysisInternal(ticker, startDate, endDate, rp1, rp2) {
+    let prices = [];
     try {
-        // 구글 토큰 검증 (google-auth-library 사용 권장)
-        // 여기서는 검증되었다고 가정하고 이메일을 추출하는 로직으로 설명합니다.
-        const payload = decodeGoogleToken(token); // 토큰 디코딩 함수 필요
-        const email = payload.email;
+        // 데이터 조회
+        const stockData = await getDailyStockData(ticker, startDate, endDate);
+        prices = stockData.map(r => ({
+            date: new Date(r.date),
+            dateStr: r.date,
+            price: parseFloat(r.close_price)
+        }));
+    } catch (e) {
+        console.error(`데이터 조회 실패 (${ticker}):`, e);
+        return { ticker, error: "데이터 조회 오류" };
+    }
 
-        // 관리자 여부 확인
-        const role = ADMIN_EMAILS.includes(email) ? 'admin' : 'user';
+    if (prices.length < 2) {
+        return { ticker, error: "데이터 부족" };
+    }
 
-        res.json({ 
-            success: true, 
-            email: email,
-            role: role 
+    const startItem = prices[0];
+    const endItem = prices[prices.length - 1];
+    const basePrice = startItem.price;
+
+    // --- 통계 및 차트 데이터 계산 (기존 로직과 동일) ---
+    let maxPrice = 0;
+    let minMdd = 0;
+    let sumMdd = 0;
+
+    const thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+    const ddCounts = { 0.1: 0, 0.2: 0, 0.3: 0, 0.4: 0, 0.5: 0, 0.6: 0 };
+    const isUnderWater = { 0.1: false, 0.2: false, 0.3: false, 0.4: false, 0.5: false, 0.6: false };
+
+    let lastPeakDate = prices[0].date;
+    let recoveryDays = [];
+    // [신규] 회복일수 빈도 집계용 객체
+    const recoveryDist = { under30: 0, under90: 0, under180: 0, under365: 0, over365: 0 };
+    const history = [];
+
+    prices.forEach((p) => {
+        const price = p.price;
+
+        if (price > maxPrice) {
+            if (maxPrice > 0) {
+                const diffDays = Math.ceil(Math.abs(p.date - lastPeakDate) / (1000 * 60 * 60 * 24));
+                if (diffDays > 0) {
+                    recoveryDays.push(diffDays);
+                    // [신규] 구간별 빈도 계산
+                    if (diffDays <= 30) recoveryDist.under30++;
+                    else if (diffDays <= 90) recoveryDist.under90++;
+                    else if (diffDays <= 180) recoveryDist.under180++;
+                    else if (diffDays <= 365) recoveryDist.under365++;
+                    else recoveryDist.over365++;
+                }
+            }
+            maxPrice = price;
+            lastPeakDate = p.date;
+            thresholds.forEach(th => isUnderWater[th] = false);
+        }
+
+        const dd = (price - maxPrice) / maxPrice;
+        if (dd < minMdd) minMdd = dd;
+        sumMdd += dd;
+
+        thresholds.forEach(th => {
+            if (dd <= -th && !isUnderWater[th]) {
+                ddCounts[th]++;
+                isUnderWater[th] = true;
+            }
         });
-    } catch (error) {
-        res.status(401).json({ success: false, message: '인증 실패' });
+
+        const currentYield = ((price - basePrice) / basePrice) * 100;
+        const currentMdd = dd * 100;
+
+        history.push({
+            d: p.dateStr,
+            y: parseFloat(currentYield.toFixed(2)),
+            m: parseFloat(currentMdd.toFixed(2))
+        });
+    });
+
+    const avgMdd = (sumMdd / prices.length) * 100;
+    const finalMinMdd = minMdd * 100;
+    const maxRecovery = recoveryDays.length ? Math.max(...recoveryDays) : 0;
+    const avgRecovery = recoveryDays.length ? (recoveryDays.reduce((a, b) => a + b, 0) / recoveryDays.length) : 0;
+
+// --- Rolling CAGR --- (수정됨)
+    const rollingArr1 = [];
+    const rollingArr2 = [];
+    let idx1 = 0, idx2 = 0;
+
+    for (let i = 0; i < prices.length; i++) {
+        const curr = prices[i];
+        
+        // [중요] 화면에서 입력받은 변수(rp1, rp2)를 사용하여 기준 날짜 계산
+        const d1 = new Date(curr.date); d1.setFullYear(curr.date.getFullYear() - rp1);
+        const d2 = new Date(curr.date); d2.setFullYear(curr.date.getFullYear() - rp2);
+        const t1 = d1.getTime();
+        const t2 = d2.getTime();
+
+        // 날짜 인덱스 조정
+        while (idx1 < i && prices[idx1].date.getTime() < t1) idx1++;
+        while (idx2 < i && prices[idx2].date.getTime() < t2) idx2++;
+
+        // [오류 수정] val1, val2 변수를 여기서 미리 선언 (초기값 null)
+        let val1 = null; 
+        let val2 = null;
+
+        // 1. Rolling Period 1 계산 (입력받은 rp1 사용)
+        const p1 = prices[idx1];
+        if (p1 && p1.date.getTime() >= t1 && (p1.date.getTime() - t1) < 86400000 * (rp1 + 1)) { 
+            // 데이터 공백이 너무 크지 않은 경우만 계산 (rp1 + 1년 여유)
+            val1 = calculateCAGR(p1.price, curr.price, rp1);
+            rollingArr1.push(val1);
+        }
+
+        // 2. Rolling Period 2 계산 (입력받은 rp2 사용)
+        const p2 = prices[idx2];
+        if (p2 && p2.date.getTime() >= t2 && (p2.date.getTime() - t2) < 86400000 * (rp2 + 1)) {
+            val2 = calculateCAGR(p2.price, curr.price, rp2);
+            rollingArr2.push(val2);
+        }
+
+        // [데이터 병합] 위에서 계산한 val1, val2를 history 배열에 주입
+        // (history 배열은 위쪽 prices.forEach에서 이미 생성됨)
+        if (history[i]) {
+            history[i].r1 = val1; // Rolling 1 (화면 입력값 1)
+            history[i].r2 = val2; // Rolling 2 (화면 입력값 2)
+        }
+    }
+
+    const statsRolling = (arr) => ({
+        min: arr.length ? Math.min(...arr) : null,
+        max: arr.length ? Math.max(...arr) : null,
+        med: arr.length ? getMedian(arr) : null
+    });
+
+    // --- Period CAGR ---
+    const periods = [
+        { label: 'total', years: (endItem.date - startItem.date) / (1000 * 3600 * 24 * 365.25), refPrice: startItem.price },
+        { label: '30y', years: 30 }, { label: '25y', years: 25 }, { label: '20y', years: 20 },
+        { label: '15y', years: 15 }, { label: '10y', years: 10 }, { label: '7y', years: 7 },
+        { label: '5y', years: 5 }, { label: '3y', years: 3 }, { label: '1y', years: 1 },
+        { label: '6m', years: 0.5 }, { label: '3m', years: 0.25 }, { label: '1m', years: 1/12 }
+    ];
+
+    const periodCagrs = {};
+    periods.forEach(p => {
+        if (p.label === 'total') {
+            periodCagrs['total'] = calculateCAGR(p.refPrice, endItem.price, p.years);
+        } else {
+            const targetDate = new Date(endItem.date);
+            if (p.years < 1) {
+                targetDate.setMonth(targetDate.getMonth() - Math.round(p.years * 12));
+            } else {
+                targetDate.setFullYear(targetDate.getFullYear() - p.years);
+            }
+            const pastItem = prices.find(item => item.date >= targetDate);
+            if (pastItem && pastItem.date <= new Date(targetDate.getTime() + 86400000 * 15)) {
+                periodCagrs[p.label] = calculateCAGR(pastItem.price, endItem.price, p.years);
+            } else {
+                periodCagrs[p.label] = null;
+            }
+        }
+    });
+
+    return {
+        ticker,
+        period: { start: startItem.date.toISOString().split('T')[0], end: endItem.date.toISOString().split('T')[0] },
+        mdd: { max: finalMinMdd, avg: avgMdd },
+        ddCounts,
+        recovery: { max: maxRecovery, avg: avgRecovery },
+        recoveryDist: recoveryDist, // [추가] 프론트엔드 차트용 데이터
+        rolling: { r10: statsRolling(rollingArr1), r5: statsRolling(rollingArr2) },
+        periodCagrs,
+        history,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp() // 캐싱 시점 기록
+    };
+}
+
+// ============================================================
+// [신규 API] 배치 작업용: 지수(^) 분석 실행 및 DB 저장
+// ============================================================
+app.post('/api/batch/analyze-indices', async (req, res) => {
+    try {
+        console.log("[Batch] 지수 분석 및 캐싱 시작...");
+        
+        // 1. 모든 티커 가져오기
+        const snapshot = await firestore.collection('tickers').get();
+        // 2. '^'로 시작하는 지수만 필터링
+        const indexTickers = snapshot.docs
+            .map(doc => doc.id)
+            .filter(id => id.startsWith('^'));
+
+        const today = new Date().toISOString().split('T')[0];
+        const results = [];
+
+        // 3. 각 지수별 분석 실행 및 저장
+        for (const ticker of indexTickers) {
+            console.log(`[Batch] 분석 중: ${ticker}`);
+            // 기본값: 1980년부터 오늘까지, Rolling 10년/5년
+            const analysisResult = await performAnalysisInternal(ticker, '1980-01-01', today, 10, 5);
+
+            if (!analysisResult.error) {
+                // DB에 'analysis_cache' 컬렉션에 저장 (용량 절약을 위해 history는 제외할 수도 있으나, 차트를 위해 포함)
+                await firestore.collection('analysis_cache').doc(ticker).set(analysisResult);
+                results.push(ticker);
+            }
+        }
+
+        console.log(`[Batch] 총 ${results.length}개 지수 분석 완료`);
+        res.json({ success: true, count: results.length, tickers: results });
+
+    } catch (err) {
+        console.error("[Batch Error]", err);
+        res.status(500).json({ error: err.message });
     }
 });
 
-// ----------------------------------------------------------------
-// 어디서든 사용할 함수
-// ----------------------------------------------------------------
-// Helper: nper 로직
-function nper_custom(rate, pv, fv) {
+// ============================================================
+// [수정 API] 프론트엔드 호출용: 캐시 우선 조회 (스마트 라우터)
+// ============================================================
+app.post('/api/analyze-ticker-performance', verifyToken, async (req, res) => {
+    const { tickers, startDate, endDate, rollingPeriod1, rollingPeriod2 } = req.body;
+    const rp1 = parseInt(rollingPeriod1) || 10;
+    const rp2 = parseInt(rollingPeriod2) || 5;
+
+    if (!tickers || !Array.isArray(tickers) || tickers.length === 0) return res.json([]);
+
     try {
-        const val = Math.abs(fv) / pv;
-        if (val <= 0) return 0;
-        return Math.log(val) / Math.log(1 + rate);
-    } catch (e) {
-        return 0;
+        const analysisPromises = tickers.map(async (ticker) => {
+            // [캐시 전략] 
+            // 1. 지수(^)이고 
+            // 2. Rolling 기간이 기본값(10, 5)이며
+            // 3. 종료일이 오늘(또는 미지정)인 경우 -> DB 캐시 확인
+            const isIndex = ticker.startsWith('^');
+            const isDefaultRolling = (rp1 === 10 && rp2 === 5);
+            const isRecent = !endDate || endDate >= new Date().toISOString().split('T')[0];
+
+            if (isIndex && isDefaultRolling && isRecent) {
+                const cacheDoc = await firestore.collection('analysis_cache').doc(ticker).get();
+                if (cacheDoc.exists) {
+                    console.log(`[Cache Hit] ${ticker} - 캐시된 데이터 반환`);
+                    return cacheDoc.data(); // 저장된 데이터 바로 반환
+                }
+            }
+
+            // 캐시가 없거나 조건이 안 맞으면 실시간 계산
+            console.log(`[Realtime Calc] ${ticker} - 실시간 계산 수행`);
+            return await performAnalysisInternal(ticker, startDate, endDate, rp1, rp2);
+        });
+
+        const results = await Promise.all(analysisPromises);
+        res.json(results);
+
+    } catch (err) {
+        console.error("Analysis Error:", err);
+        res.status(500).json({ error: "분석 중 오류 발생" });
     }
+});
+
+// ============================================================
+// [Batch] 전체 종목 병렬 분석 및 Market Map 데이터 생성 (최적화 버전)
+// ============================================================
+app.post('/api/batch/analyze-all-tickers', verifyToken, logTraffic, async (req, res) => {
+    // 타임아웃 방지 (분석량이 많으므로 10분 설정)
+    req.setTimeout(600000); 
+
+    try {
+        console.log("🚀 [Batch] 전체 종목 병렬 분석 시작...");
+
+        const snapshot = await firestore.collection('tickers').get();
+        const targetDocs = snapshot.docs;
+        const totalDocs = targetDocs.length;
+        
+        console.log(`📋 분석 대상: 총 ${totalDocs}개 종목`);
+
+        // ============================================================
+        // [비즈니스 로직] 등급별 처리 속도 설정 (전략 분석 로직 참조)
+        // ============================================================
+        const userRole = req.user.role || 'G1';
+        const isVip = ['G9', 'admin'].includes(userRole);
+
+        // VIP: 한 번에 30개씩 (분석 부하 고려), 일반: 5개씩
+        const BATCH_SIZE = isVip ? 30 : 5; 
+        const DELAY_MS = isVip ? 0 : 500; 
+        
+        const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        const today = new Date().toISOString().split('T')[0];
+        const summaryList = []; 
+        let successCount = 0;
+        let failCount = 0;
+
+        // ============================================================
+        // [핵심 로직] 배치 단위 병렬 실행 (Throttling 적용)
+        // ============================================================
+        for (let i = 0; i < totalDocs; i += BATCH_SIZE) {
+            // 현재 처리할 묶음 (Chunk)
+            const chunk = targetDocs.slice(i, i + BATCH_SIZE);
+
+            // 해당 묶음 병렬 실행
+            const promises = chunk.map(async (doc) => {
+                const tickerData = doc.data();
+                const ticker = doc.id;
+
+                try {
+                    // 분석 함수 호출 (백엔드 공통 함수 사용)
+                    const result = await performAnalysisInternal(ticker, '1990-01-01', today, 10, 5);
+
+                    if (result.error) {
+                        console.warn(`⚠️ [Skip] ${ticker}: ${result.error}`);
+                        return null;
+                    }
+
+                    // [저장 1] 상세 데이터 저장 (비동기 처리)
+                    firestore.collection('analysis_results').doc(ticker).set(result)
+                        .catch(e => console.error(`상세 저장 실패(${ticker}):`, e));
+
+                    // 요약 데이터 반환
+                    return {
+                        ticker: ticker,
+                        name_kr: tickerData.ticker_name_kr || ticker,
+                        sector: tickerData.sector || 'Etc',
+                        period_start: result.period.start,
+                        period_end: result.period.end,
+                        listing_days: getDaysDiff(result.period.start, result.period.end),
+                        listing_years: (getDaysDiff(result.period.start, result.period.end) / 365).toFixed(1),
+                        cagr: result.periodCagrs['total'],
+                        mdd: result.mdd.max,
+                        r10_min: result.rolling.r10.min,
+                        r10_med: result.rolling.r10.med,
+                        r10_max: result.rolling.r10.max,
+                        recovery_max: result.recovery.max,
+                        recovery_avg: result.recovery.avg,
+                        updatedAt: new Date().toISOString()
+                    };
+
+                } catch (innerErr) {
+                    console.error(`💥 [Error] ${ticker} 처리 중 예외 발생:`, innerErr);
+                    return null;
+                }
+            });
+
+            // 현재 배치 완료 대기
+            const results = await Promise.all(promises);
+            
+            // 결과 수집
+            results.forEach(res => {
+                if (res) {
+                    summaryList.push(res);
+                    successCount++;
+                } else {
+                    failCount++;
+                }
+            });
+
+            console.log(`.. 진행률: ${Math.min(i + BATCH_SIZE, totalDocs)}/${totalDocs} 완료 (성공: ${successCount})`);
+
+            // VIP가 아니고 다음 배치가 있다면 지연 시간 부여 (서버 부하 방지)
+            if (i + BATCH_SIZE < totalDocs && DELAY_MS > 0) {
+                await sleep(DELAY_MS);
+            }
+        }
+
+        // [저장 2] Market Map 스냅샷 저장 (Batch 사용)
+        if (summaryList.length > 0) {
+            const SNAPSHOT_CHUNK_SIZE = 500;
+            const totalSnapshotChunks = Math.ceil(summaryList.length / SNAPSHOT_CHUNK_SIZE);
+            const batch = firestore.batch();
+
+            for (let i = 0; i < totalSnapshotChunks; i++) {
+                const chunk = summaryList.slice(i * SNAPSHOT_CHUNK_SIZE, (i + 1) * SNAPSHOT_CHUNK_SIZE);
+                const docRef = firestore.collection('market_map_snapshot').doc(`batch_${i}`);
+                
+                batch.set(docRef, {
+                    batch_index: i,
+                    total_batches: totalSnapshotChunks,
+                    updated_at: admin.firestore.FieldValue.serverTimestamp(),
+                    tickers: chunk
+                });
+            }
+
+            await batch.commit();
+            console.log("✅ [Batch] 모든 데이터 저장 완료!");
+
+            res.json({ 
+                success: true, 
+                analyzed: successCount, 
+                failed: failCount, 
+                snapshot_chunks: totalSnapshotChunks 
+            });
+        } else {
+            res.json({ success: false, message: "분석된 데이터가 없습니다." });
+        }
+
+    } catch (err) {
+        console.error("🔥 [Batch Critical Error]", err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// [보조 함수] 날짜 차이 계산
+function getDaysDiff(startStr, endStr) {
+    const s = new Date(startStr);
+    const e = new Date(endStr);
+    return Math.floor((e - s) / (1000 * 60 * 60 * 24));
 }
 
 // ----------------------------------------------------------------
@@ -285,7 +873,6 @@ function nper_custom(rate, pv, fv) {
 // ----------------------------------------------------------------
 async function getDailyStockData(ticker, start, end) {
     try {
-        // 무조건 Firestore 'ticker_prices' 컬렉션 조회
         const doc = await firestore.collection('ticker_prices').doc(ticker).get();
         
         if (!doc.exists) {
@@ -295,85 +882,43 @@ async function getDailyStockData(ticker, start, end) {
 
         const data = doc.data();
         const labels = data.labels || [];
-        const prices = data.prices || []; // values 대신 prices 사용
+        const prices = data.prices || [];
 
-        // 데이터를 객체 배열 포맷으로 변환 및 필터링
-        const rows = labels.map((date, index) => {
+        // 1. 데이터 매핑 (날짜와 가격을 묶음)
+        let rawRows = labels.map((date, index) => {
             const dDate = date.includes('T') ? date.split('T')[0] : date;
-            const p = prices[index]; // 해당 날짜의 가격 객체 {o, h, l, c}
+            const p = prices[index];
 
             return {
                 date: dDate,
-                // DB에 저장된 소수점 4자리 데이터를 그대로 가져옴
-                // 만약 구형 데이터(단일 숫자)가 섞여있을 경우를 대비해 예외처리 포함
-                close_price: p && typeof p === 'object' ? p.c : p, 
+                close_price: p && typeof p === 'object' ? p.c : p,
                 open_price:  p && typeof p === 'object' ? p.o : p,
                 high_price:  p && typeof p === 'object' ? p.h : p,
                 low_price:   p && typeof p === 'object' ? p.l : p
             };
-        }).filter(row => {
-            // 날짜 범위 필터링
-            if (start && end) return row.date >= start && row.date <= end;
-            return true;
         });
 
-        // 날짜 기준 오름차순 정렬
-        return rows.sort((a, b) => a.date.localeCompare(b.date));
+        // 2. [핵심 수정] 날짜(date) 기준 중복 제거 (Map 사용)
+        const uniqueMap = new Map();
+        rawRows.forEach(row => {
+            // 날짜 범위 필터링을 여기서 미리 수행하여 불필요한 연산 감소
+            if ((!start || row.date >= start) && (!end || row.date <= end)) {
+                uniqueMap.set(row.date, row); // 같은 날짜가 있으면 덮어씌움 (중복 제거)
+            }
+        });
+
+        // 3. 중복 제거된 데이터를 배열로 변환 후 날짜 오름차순 정렬
+        const sortedRows = Array.from(uniqueMap.values()).sort((a, b) => {
+            return a.date.localeCompare(b.date);
+        });
+
+        return sortedRows;
+
     } catch (err) {
         console.error(`Firestore 조회 에러 (${ticker}):`, err.message);
         throw err;
     }
 }
-
-// [백엔드 수정] 권한에 따라 로컬 DB 또는 Firestore에서 데이터를 조회하는 표준 API
-// [백엔드] 권한 기반 통합 주가 조회 API
-app.get('/api/stocks-bulk', async (req, res) => {
-    const { tickers, start, end } = req.query; 
-    if (!tickers) return res.status(400).json({ error: "티커 코드가 없습니다." });
-
-    const tickerList = tickers.split(',');
-
-    try {
-        const bulkResults = [];
-        
-        // 병렬 처리를 통해 여러 티커 데이터를 Firestore에서 가져옴
-        await Promise.all(tickerList.map(async (ticker) => {
-            const doc = await firestore.collection('ticker_prices').doc(ticker).get();
-            
-            if (doc.exists) {
-                const data = doc.data();
-                const labels = data.labels || [];
-                const prices = data.prices || []; // [수정] values -> prices
-
-                labels.forEach((date, index) => {
-                    const dDate = date.includes('T') ? date.split('T')[0] : date;
-                    
-                    // 요청된 기간 필터링
-                    if (dDate >= start && dDate <= end) {
-                        const p = prices[index];
-                        
-                        // [수정] 객체 구조 대응: p.c(종가) 사용
-                        // 소수점 4자리는 DB에 이미 반영되어 있으므로 그대로 사용됩니다.
-                        const closePrice = p && typeof p === 'object' ? p.c : p;
-
-                        bulkResults.push({
-                            ticker: ticker,
-                            date: dDate,
-                            close_price: closePrice
-                        });
-                    }
-                });
-            }
-        }));
-
-        // 날짜 기준 오름차순 정렬
-        bulkResults.sort((a, b) => a.date.localeCompare(b.date));
-        return res.json(bulkResults);
-    } catch (err) {
-        console.error(`Bulk fetch error:`, err.message);
-        res.status(500).json({ error: "주가 데이터를 불러오는 중 오류가 발생했습니다." });
-    }
-});
 
 // ----------------------------------------------------------------
 // 티커 마스터 관리 API
@@ -425,6 +970,57 @@ app.get('/api/tickers', async (req, res) => {
     }
 });
 
+// [Backend] 사용자별 관심종목 전제 데이터 반환 API
+// [server.js] 기존 기능을 유지하며 확장된 로직
+// [server.js] 기존 로직을 유지하되 데이터 추출 부분을 더 정교하게 수정
+app.get('/api/user/investments/:email', verifyToken, async (req, res) => {
+    try {
+        const { email } = req.params;
+        const docRef = firestore.collection('investment_tickers').doc(email);
+        const doc = await docRef.get();
+
+        if (!doc.exists) return res.status(200).json([]);
+
+        const data = doc.data();
+        let tickerMap = {};
+
+        // 헬퍼 함수: DB 필드(fee_rate, tax_rate)를 프론트에서 쓰는 명칭으로 매핑
+        const extractItem = (item, key) => ({
+            ticker: item.ticker || key,
+            ticker_name_kr: item.ticker_name_kr || "",
+            description: item.description || "",
+            // [중요] DB 필드명을 그대로 유지하여 프론트 전달
+            fee_rate: (item.fee_rate !== undefined && item.fee_rate !== null) ? item.fee_rate : 0,
+            tax_rate: (item.tax_rate !== undefined && item.tax_rate !== null) ? item.tax_rate : 0,
+            createdAt: item.createdAt || ""
+        });
+
+        // [사진 구조 반영] investments 객체 내부 순회
+        if (data.investments && typeof data.investments === 'object') {
+            Object.keys(data.investments).forEach(key => {
+                const itemData = data.investments[key];
+                // null 체크 (삭제 대기 데이터 등 방어 코드)
+                if (itemData) {
+                    tickerMap[key] = extractItem(itemData, key);
+                }
+            });
+        }
+
+        // Dot notation (investments.TQQQ 형태) 필드가 혼재할 경우를 대비한 방어 코드
+        Object.keys(data).forEach(key => {
+            if (key.startsWith('investments.') && data[key]) {
+                const tickerCode = key.split('.')[1];
+                tickerMap[tickerCode] = extractItem(data[key], tickerCode);
+            }
+        });
+
+        const tickerArray = Object.values(tickerMap).sort((a, b) => a.ticker.localeCompare(b.ticker));
+        res.status(200).json(tickerArray);
+    } catch (error) {
+        console.error("[Get investments Error]:", error);
+        res.status(500).json({ error: "관심종목 로드 실패" });
+    }
+});
 // ----------------------------------------------------------------
 // 2. 야후 파이낸스 가격 업데이트 (Upsert 로직 적용)
 // ----------------------------------------------------------------
@@ -682,314 +1278,883 @@ app.get('/api/daily-stock', async (req, res) => {
     }
 });
 
-// [수정] API 엔드포인트 부분
-app.get('/api/simulation-summary', async (req, res) => {
-    try {
-        const { ticker, start, end, initCash, initStock, targetRate, upperRate, lowerRate, unitGap } = req.query;
-        
-        const [tickerData, ndxData] = await Promise.all([
-            getDailyStockData(ticker, start, end),
-            getDailyStockData('^NDX', start, end)
-        ]);
+// ----------------------------------------------------------------
+// [엔진] 시뮬레이션 핵심 로직 - 주가 데이터 주입(Injection) 지원
+// ----------------------------------------------------------------
+// [최적화] nper 함수 (try-catch 제거)
+function nper_custom(rate, pv, fv) {
+    if (rate === 0) return 0;
+    const val = Math.abs(fv) / pv;
+    if (val <= 0) return 0;
+    return Math.log(val) / Math.log(1 + rate);
+}
 
-        if (!tickerData || tickerData.length === 0) {
-            return res.status(404).json({ success: false, error: "조회된 데이터가 없습니다." });
-        }
+// [핵심] 시뮬레이션 엔진 - 12단계 정밀 로직 100% 완전 복원 버전 (Gap/Split 분리 전용)
+async function runSimulationInternal(params, preLoadedPriceData = null) {
+    const { 
+        ticker, start, end, initCash, initStock, targetRate, upperRate, lowerRate, 
+        // [수정] unitGap, split 제거 및 개별 변수 확정 사용
+        gapBuy, gapSell, 
+        splitBuy, splitSell, 
+        alarmBuy, alarmSell, // [추가] 알람 파라미터
+        withdraw, feeRate, taxRate,
+        responseType // 차트 최적화를 위한 플래그 (1:상세, 2:차트용, 3:최근기록)
+    } = params;
 
-        // 새로 만든 함수 호출
-        const result = await runSimulationInternal({
-            ticker, start, end, initCash, initStock, targetRate, upperRate, lowerRate, unitGap
-        });
-
-        if (!result) return res.json({ success: false, message: "No data" });
-
-        // [핵심] 시뮬레이션 결과와 별개로, DB 원본 데이터에서 직접 통계 추출
-        const lastTicker = tickerData.length > 0 ? tickerData[tickerData.length - 1] : { close_price: 0, date: null };
-        const lastNdx = ndxData.length > 0 ? ndxData[ndxData.length - 1] : { close_price: 0 };
-
-        res.json({
-            success: true,
-            // NDX 영역: DB 원본 데이터(ndxData)를 직접 사용하여 계산
-            ndx: {
-                max: ndxData.length > 0 ? Math.max(...ndxData.map(d => d.close_price || 0)) : 0,
-                last: lastNdx.close_price || 0
-            },
-            // 선택 티커 영역 (TQQQ 등): DB 원본 데이터(tickerData)를 직접 사용하여 계산
-            tickerStats: {
-                max: Number(tickerData.length > 0 ? Math.max(...tickerData.map(d => d.close_price || 0)) : 0),
-                last: Number(tickerData.length > 0 ? tickerData[tickerData.length - 1].close_price : 0),
-                date: tickerData.length > 0 ? tickerData[tickerData.length - 1].date : null
-            },
-            // 시뮬레이션 엔진이 계산한 결과들
-            rows: result.rows,
-            summary: result.lastStatus,
-            chart: result.chartData,
-        });
-    } catch (e) {
-        console.error("Simulation API Error:", e);
-        res.status(500).json({ success: false, error: e.message });
+    // 1. 데이터 준비
+    let priceData = preLoadedPriceData;
+    if (!priceData) {
+        priceData = await getDailyStockData(ticker, start, end);
     }
-});
-
-// [추가] 시뮬레이션 핵심 로직 - 대량/단일 공용 (기존 로직 완벽 복합)
-async function runSimulationInternal(params) {
-    const { ticker, start, end, initCash, initStock, targetRate, upperRate, lowerRate, unitGap } = params;
-
-    // 1. 데이터 조회
-    const priceData = await getDailyStockData(ticker, start, end);
+    
+    // 데이터가 최소 2일치는 있어야 지표 산출 가능
     if (!priceData || priceData.length === 0) return null;
 
-    // 2. 파라미터 초기화 (기존 변수명과 로직 준수)
+    // 2. 파라미터 초기화
     const initStockRate = parseFloat(initStock) / 100;
     const initCashVal = parseFloat(initCash);
     const targetYearRate = parseFloat(targetRate) / 100;
     const upperPct = parseFloat(upperRate) / 100;
     const lowerPct = parseFloat(lowerRate) / 100;
-    const unitGapPct = parseFloat(unitGap) / 100;
-    const targetDayRate = Math.pow(1 + targetYearRate, 1 / 365) - 1;
+    
+    const p_gapBuyPct = parseFloat(gapBuy) / 100;
+    const p_gapSellPct = parseFloat(gapSell) / 100;
+    const p_splitBuy = parseInt(splitBuy);
+    const p_splitSell = parseInt(splitSell);
 
-    // 초기값 설정 (기존 로직: 첫날 vBasis 설정 및 초기 매수)
-    let vBasis = initCashVal * initStockRate;
-    let cash = initCashVal - vBasis;
+    // [추가] 알람 비율 파라미터 처리
+    const p_alarmBuy = parseFloat(alarmBuy || 0) / 100;
+    const p_alarmSell = parseFloat(alarmSell || 0) / 100;
+
+    // [인출] 인출 비율 파라미터 처리
+    const withdrawPct = parseFloat(withdraw || 0) / 100;
+
+    const targetDayRate = Math.pow(1 + targetYearRate, 1 / 365) - 1;
+    const fRate = parseFloat(feeRate || 0);
+    const tRate = parseFloat(taxRate || 0);
+    const feeMultiplier = 1 + fRate; 
+
+    // 초기값 설정
+    let vTarget = initCashVal * initStockRate;
     let maxMddRate = 0;
     let highAsset = initCashVal;
-    let shares = Math.floor(vBasis / parseFloat(priceData[0].close_price));
-    let totalPurchaseAmt = shares * parseFloat(priceData[0].close_price);
     
-    const chartData = { labels: [], ev: [], vU: [], vB: [], vL: [] };
-    let rows = [];
+    // 첫날 데이터 기준 초기화
+    const firstClose = parseFloat(priceData[0].close_price);
+    let shares = Math.floor(vTarget / feeMultiplier / firstClose);
+    let totalPurchaseAmt = shares * firstClose * feeMultiplier; // 평단가 계산용 총 매수금액
+    let cash = initCashVal - totalPurchaseAmt;
 
-    // 3. 루프 시작
-    priceData.forEach((day, i) => {
+    vTarget = shares * firstClose;
+    
+    // 이전 상태 추적 변수
+    let last_asset = initCashVal; 
+    let last_curLower = vTarget * lowerPct;
+    let last_curUpper = vTarget * upperPct;
+    let totalFailCount = 0;
+    let totalWithdrawal = 0;   
+    let totalBuyAmt = 0;
+    let totalSellAmt = 0;
+    let totalProfit = 0;
+    let totalTax = 0;
+    let totalFee = 0;
+
+    // [추가] 통계 집계용 변수 초기화
+    let totalBuyCount = 0;
+    let totalSellCount = 0;
+    let totalBuyAlarmCount = 0;
+    let totalSellAlarmCount = 0;
+    let sumStockRatio = 0;
+    let sumMDD = 0;
+    let sumAsset = 0; // [신규] 자산 합계 (회전율 계산용)
+
+    // [신규] 추가 통계 변수
+    let maxStockRatio = -1;
+    let minStockRatio = 9999;
+    let totalBuyMissCount = 0;
+    let totalSellMissCount = 0;
+    
+    // 최대회복기간 계산용
+    let lastHighAssetDayIdx = 0;
+    let maxRecoveryDays = 0;
+
+    // 결과 담을 컨테이너
+    const rType = responseType || 1;
+    const rows = (rType === 1) ? [] : null;
+    const chartData = (rType === 1) ? { labels: [], ev: [], vU: [], vB: [], vL: [] } : null;
+    
+    // [추가] 년도별 요약 데이터 컨테이너
+    const yearlyReturns = []; 
+
+    // rType 2 (차트용 경량 데이터)
+    const chartArrays = (rType === 2) 
+        ? { dates: [], closes: [], assets: [], mdds: [], shares: [], lowers: [], uppers: [], ratios: [] } 
+        : null;
+
+    // rType 3 (최근 기록용)
+    const recentHistory = (rType === 3) ? [] : null;
+    const startRecordingIdx = Math.max(0, priceData.length - 14);
+
+    // 3. 메인 시뮬레이션 루프
+    for (let i = 0; i < priceData.length; i++) {
+        const day = priceData[i];
         const open = parseFloat(day.open_price);
         const high = parseFloat(day.high_price);
         const low = parseFloat(day.low_price);
         const close = parseFloat(day.close_price);
-        const startCash = cash;
-        const prevShares = shares;
-        const prevLower = i === 0 ? vBasis * lowerPct : rows[i-1].curLower;
-        const prevUpper = i === 0 ? vBasis * upperPct : rows[i-1].curUpper;
         
         const dateStr = day.date instanceof Date ? day.date.toISOString().split('T')[0] : String(day.date).split('T')[0];
+        
+        // [수정] startCash는 인출 로직에 의해 변경될 수 있으므로 let으로 선언
+        let startCash = cash; 
+        let prevCash = cash; 
+        let dailyWithdrawal = 0; // 금일 인출 금액
 
-        // [매매단위수량 계산] 전일보유수량 * 단위gap (최소 1주)
+        const prevShares = shares;
+        // 기존 로직: 첫날은 vTarget 기준, 이후는 전일 데이터(last_curLower) 기준
+        const prevLower = i === 0 ? vTarget * lowerPct : last_curLower;
+        const prevUpper = i === 0 ? vTarget * upperPct : last_curUpper;
+
+        // [매매단위수량 계산] - 매수/매도 Gap 기준
+        let unitQtyBuy = Math.floor(prevShares * p_gapBuyPct);
+        let unitQtySell = Math.floor(prevShares * p_gapSellPct);
+        if (unitQtyBuy <= 0) unitQtyBuy = 1;
+        if (unitQtySell <= 0) unitQtySell = 1;
+
         let diffDays = 0;
-        let unitShares = Math.floor(prevShares * unitGapPct);
-
-        if (unitShares <= 0) unitShares = 1;
-
         if (i > 0) {
             const prevDate = new Date(priceData[i-1].date);
             const currDate = new Date(priceData[i].date);
             diffDays = (currDate - prevDate) / (1000 * 60 * 60 * 24);
-            vBasis *= Math.pow(1 + targetDayRate, diffDays);
+            
+            // 목표가치 증가 (복리)
+            vTarget *= Math.pow(1 + targetDayRate, diffDays);
+
+            // [인출] 로직
+            if (withdrawPct > 0) {
+                dailyWithdrawal = last_asset * withdrawPct * (diffDays / 365);
+                if (dailyWithdrawal > startCash) dailyWithdrawal = startCash;
+                startCash -= dailyWithdrawal;
+            }
         }
 
-        const curUpper = vBasis * upperPct;
-        const curLower = vBasis * lowerPct;
+        const curUpper = vTarget * upperPct;
+        const curLower = vTarget * lowerPct;
 
         // ----------------------------------------------------------------
-        // [매수(Buy) 12단계 로직]
+        // [추가] 알람(Alarm) 계산 로직
         // ----------------------------------------------------------------
-        let bOpenReq = (prevShares * open < prevLower * (1 - unitGapPct)) ? (prevLower - (prevShares * open)) : 0;
-        if (bOpenReq * 1.0007 > startCash) bOpenReq = startCash / 1.0007;
+        let isBuyAlarm = 0;
+        let isSellAlarm = 0;
 
-        let bOpenCount = (bOpenReq > 0 && prevShares > 0) ? Math.floor(nper_custom(-unitGapPct, prevLower / prevShares, -open)) : 0;
-        let bOpenPrice = bOpenCount > 0 ? open : 0;
-        let bOpenQty = bOpenCount * unitShares;
-        let bOpenAmt = bOpenQty * bOpenPrice * 1.0007;
+        // 알람 계산을 위한 전일 종가 (첫날은 시가 사용)
+        const prevClose = i === 0 ? open : parseFloat(priceData[i-1].close_price);
 
-        let bLowReq = (prevShares * low < prevLower * (1 - unitGapPct)) ? (prevLower - (prevShares * low) - bOpenReq) : 0;
-        if (bLowReq * 1.0007 > (startCash - bOpenAmt)) bLowReq = Math.max(0, (startCash - bOpenAmt) / 1.0007);
+        if (prevShares > 0) {
+            // 매수/매도 시작 예약가 계산 (Start Price)
+            const calcBuyStart = (prevLower * (1 - p_gapBuyPct)) / prevShares;
+            const calcSellStart = (prevUpper * (1 + p_gapSellPct)) / prevShares;
 
-        let bLowCount = (bLowReq > 0 && prevShares > 0) ? Math.floor(nper_custom(-unitGapPct, prevLower / prevShares, -low)) - bOpenCount : 0;
-        if (bLowCount < 0) bLowCount = 0;
+            // 매수 알람
+            if (p_alarmBuy > 0) {
+                const buyGapRatio = (prevClose - calcBuyStart) / prevClose;
+                if (buyGapRatio < p_alarmBuy) {
+                    isBuyAlarm = 1;
+                }
+            }
 
-        let bLowFirst = bLowCount > 0 ? (prevLower / prevShares) * Math.pow(1 - unitGapPct, bOpenCount + 1) : 0;
-        let bLowLast = bLowCount > 0 ? (prevLower / prevShares) * Math.pow(1 - unitGapPct, bOpenCount + bLowCount) : 0;
-        let bLowAvg = bLowFirst > 0 ? (bLowFirst + bLowLast) / 2 : 0;
-        let bLowQty = bLowCount * unitShares;
-        let bLowAmt = bLowQty * bLowAvg * 1.0007;
-        let bAmt = bOpenAmt + bLowAmt;
-
-        // ----------------------------------------------------------------
-        // [매도(Sell) 12단계 로직]
-        // ----------------------------------------------------------------
-        // 현재 시점의 평단가 계산 (매도 시 세금 계산용)
-        const currentAvgPrice = prevShares > 0 ? totalPurchaseAmt / prevShares : 0;
-
-        let sOpenReq = (prevShares * open > prevUpper * (1 + unitGapPct)) ? (prevShares * open - prevUpper) : 0;
-        
-        let sOpenCount = (sOpenReq > 0 && prevShares > 0) ? Math.floor(nper_custom(unitGapPct, prevUpper / prevShares, -open)) : 0;
-        let sOpenPrice = sOpenCount > 0 ? open : 0;
-        let sOpenQty = sOpenCount * unitShares;
-
-        let sOpenProfit = sOpenQty * (sOpenPrice - currentAvgPrice); // 매도 수익
-        let sOpenTax = sOpenProfit > 0 ? sOpenProfit * 0.22 : 0;     // 수익의 22% 세금
-        let sOpenAmt = (sOpenQty * sOpenPrice) * 0.9993 - sOpenTax;           // 세후 현금 유입
-
-        let sHighReq = (prevShares * high > prevUpper * (1 + unitGapPct)) ? (prevShares * high - prevUpper - sOpenReq) : 0;
-        
-        let sHighCount = (sHighReq > 0 && prevShares > 0) ? Math.floor(nper_custom(unitGapPct, prevUpper / prevShares, -high)) - sOpenCount : 0;
-        if (sHighCount < 0) sHighCount = 0;
-
-        let sHighFirst = sHighCount > 0 ? (prevUpper / prevShares) * Math.pow(1 + unitGapPct, sOpenCount + 1) : 0;
-        let sHighLast = sHighCount > 0 ? (prevUpper / prevShares) * Math.pow(1 + unitGapPct, sOpenCount + sHighCount) : 0;
-        let sHighAvg = sHighFirst > 0 ? (sHighFirst + sHighLast) / 2 : 0;
-        let sHighQty = sHighCount * unitShares;
-
-        // [수정] 고가 매도 시 양도세 계산
-        let sHighProfit = sHighQty * (sHighAvg - currentAvgPrice);   // 매도 수익
-        let sHighTax = sHighProfit > 0 ? sHighProfit * 0.22 : 0;     // 수익의 22% 세금
-        let sHighAmt = (sHighQty * sHighAvg) - sHighTax;             // 세후 현금 유입
-
-        let sAmt = sOpenAmt + sHighAmt;
-      
-        // 실제 자산 반영
-        shares = prevShares + (bOpenQty + bLowQty) - (sOpenQty + sHighQty);
-        cash = startCash - (bOpenAmt + bLowAmt) + (sOpenAmt + sHighAmt);
-
-        const asset = cash + (shares * close);
-        const evalAmt = shares * close;
-        
-        if (sOpenQty + sHighQty > 0 && prevShares > 0) {
-            totalPurchaseAmt -= ((sOpenQty + sHighQty) * (totalPurchaseAmt / prevShares));
-        }
-
-        if (bOpenQty + bLowQty > 0) {
-            totalPurchaseAmt += (bOpenQty * bOpenPrice) + (bLowQty * bLowAvg);
-        }
-
-        if ( asset > highAsset) { highAsset = asset };
-        const mdd = highAsset > 0 ? ((asset - highAsset) / highAsset * 100) : 0;
-
-        // 2. [추가] 전체 기간 중 가장 큰 하락폭(가장 낮은 음수)을 maxMddRate에 보관
-        if (mdd < maxMddRate) { maxMddRate = mdd; }
-
-        rows.push({
-            date: dateStr,
-            asset,
-            mdd,
-            stockRatio: shares > 0 ? (shares * close) / asset * 100 : 0,
-            open, high, low, close,
-            startCash, sAmt, bAmt, finalCash: cash,
-            // 매수 12단계
-            bOpenReq, bOpenCount, bOpenPrice, bOpenQty, bOpenAmt,
-            bLowReq, bLowCount, bLowFirst, bLowLast, bLowAvg, bLowQty, bLowAmt,
-            // 매도 12단계
-            sOpenReq, sOpenCount, sOpenPrice, sOpenQty, sOpenAmt,
-            sHighReq, sHighCount, sHighFirst, sHighLast, sHighAvg, sHighQty, sHighAmt,
-            // 보유현황
-            shares, 
-            totalPurchaseAmt,
-            avgPrice: shares > 0 ? totalPurchaseAmt / shares : 0,
-            evalAmt,
-            vBasis, curUpper, curLower, diffDays, unitShares
-        });
-
-        chartData.labels.push(dateStr);
-        chartData.ev.push(Math.round(shares * close));
-        chartData.vB.push(Math.round(vBasis));
-        chartData.vU.push(Math.round(curUpper));
-        chartData.vL.push(Math.round(curLower));
-    });
-
-    const lastRow = rows.length > 0 ? rows[rows.length - 1] : {};
-    return { rows, chartData, lastStatus: { ...lastRow, max_mdd_rate: maxMddRate } };
-}
-
-/* [수정] 대량 시뮬레이션 및 결과 저장 API (Firestore) */
-app.post('/api/bulk-simulation', async (req, res) => {
-    const { 
-        strategy_code, ticker, bulkStart, bulkEnd, targetEnd, 
-        initCash, initStock, targetRate, upperRate, lowerRate, unitGap 
-    } = req.body;
-
-    try {
-        console.log(`[Bulk Simulation] Start: ${strategy_code} (${bulkStart} ~ ${bulkEnd})`);
-
-        // 1. 기존 데이터 삭제 (해당 전략코드 및 기간 내 결과물 삭제)
-        const resultsRef = firestore.collection('simulation_results');
-        const oldDocs = await resultsRef
-            .where('strategy_code', '==', strategy_code)
-            .where('start_date', '>=', bulkStart)
-            .where('start_date', '<=', bulkEnd)
-            .get();
-
-        if (!oldDocs.empty) {
-            const deleteBatch = firestore.batch();
-            oldDocs.forEach(doc => deleteBatch.delete(doc.ref));
-            await deleteBatch.commit();
-            console.log(`[Bulk Simulation] 기존 데이터 ${oldDocs.size}건 삭제 완료`);
-        }
-
-        // 2. 시작일 리스트 추출 (Firestore ticker_prices 문서 활용)
-        const tickerDoc = await firestore.collection('ticker_prices').doc(ticker).get();
-        if (!tickerDoc.exists) {
-            return res.status(404).json({ success: false, error: "주가 데이터가 없습니다." });
-        }
-
-        const tickerData = tickerDoc.data();
-        const labels = tickerData.labels || []; // ['2025-01-01', ...]
-        
-        // 필터링된 시작일 리스트 생성
-        const startDateList = labels.filter(date => {
-            const d = date.includes('T') ? date.split('T')[0] : date;
-            return d >= bulkStart && d <= bulkEnd;
-        }).sort();
-
-        // 3. 루프 돌며 시뮬레이션 실행 및 배치 저장 준비
-        let count = 0;
-        const saveBatch = firestore.batch();
-
-        for (const currentStart of startDateList) {
-            // 공통 함수 호출 (이 함수 내부도 Firestore를 보도록 수정되어 있어야 함)
-            const result = await runSimulationInternal({
-                ticker, start: currentStart, end: targetEnd,
-                initCash, initStock, targetRate, upperRate, lowerRate, unitGap
-            });
-
-            if (result && result.rows.length > 0) {
-                const last = result.lastStatus;
-                
-                // Firestore 문서 ID 생성 (전략코드_시작일)
-                const docId = `${strategy_code}_${currentStart}`;
-                const docRef = resultsRef.doc(docId);
-
-                saveBatch.set(docRef, {
-                    strategy_code,
-                    ticker,
-                    start_date: currentStart,
-                    end_date: last.date,
-                    end_asset: last.asset,
-                    end_stock_rate: last.stockRatio,
-                    max_mdd_rate: last.max_mdd_rate,
-                    average_price: last.avgPrice,
-                    upperRate, // 저장 시 사용자 변수명 준수
-                    lowerRate,
-                    created_at: admin.firestore.FieldValue.serverTimestamp()
-                });
-                
-                count++;
-
-                // Firestore 배치 제한(500개) 고려 - 만약 400개가 넘으면 중간 커밋
-                if (count % 400 === 0) {
-                    await saveBatch.commit();
+            // 매도 알람
+            if (p_alarmSell > 0) {
+                const sellGapRatio = (calcSellStart - prevClose) / prevClose;
+                if (sellGapRatio < p_alarmSell) {
+                    isSellAlarm = 1;
                 }
             }
         }
 
-        // 남은 배치 커밋
-        if (count % 400 !== 0) {
-            await saveBatch.commit();
+        // ----------------------------------------------------------------
+        // [수정됨] 매수/매도 로직: 구분 없이 통합 합산
+        // ----------------------------------------------------------------
+        
+        const currentAvgPrice = prevShares > 0 ? totalPurchaseAmt / prevShares : 0;
+        let dailyFailCount = 0; // 일간 실패 횟수
+
+        // [통합 변수 선언] 시가/저가/고가 구분 변수 삭제
+        let dailyBuyCount = 0;
+        let dailyBuyQty = 0;
+        let dailyBuyAmt = 0; // 수수료 포함 매수 금액 합계
+
+        let dailySellCount = 0;
+        let dailySellQty = 0;
+        let dailySellAmt = 0; // 세금/수수료 차감 후 매도 금액 합계
+        let dailyProfit = 0;  // 수익
+        let dailyTax = 0;     // 세금
+
+        // [신규] 이탈 횟수
+        let dailyBuyMiss = 0;
+        let dailySellMiss = 0;
+
+        // 임시 변수 (루프 내 계산용)
+        let tempCash = startCash;
+        let tempShares = prevShares;
+
+        // ----------------------------------------------------------------
+        // 1. 매수 계산 (Buy Calculation) - NPER Logic 적용
+        // ----------------------------------------------------------------
+        if (prevShares > 0) {
+            let buyStartPrice = (prevLower * (1 - p_gapBuyPct)) / prevShares;
+            
+            // [NPER 계산] 매수 가능 최대 횟수 계산 (Low 도달 기준)
+            let maxBuyLoops = 0;
+            if (low < buyStartPrice && p_gapBuyPct > 0) {
+                // formula: low = start * (1 - gap)^n
+                maxBuyLoops = Math.floor(Math.log(low / buyStartPrice) / Math.log(1 - p_gapBuyPct)) + 1;
+            }
+
+            // 실제 루프 횟수는 설정된 split과 계산된 max 중 큰 값 (이탈 계산을 위해)
+            const loopLimitBuy = Math.max(p_splitBuy, maxBuyLoops);
+
+            let currentTarget = buyStartPrice;
+            
+            // 매수 타겟 리스트 생성
+            let buyTargets = [];
+            for (let k = 0; k < loopLimitBuy; k++) {
+                buyTargets.push({ price: currentTarget, index: k });
+                currentTarget = currentTarget * (1 - p_gapBuyPct);
+            }
+            
+            // 내림차순 정렬
+            buyTargets.sort((a, b) => b.price - a.price);
+
+            for (let item of buyTargets) {
+                const price = item.price;
+                const idx = item.index; // 0부터 시작
+
+                let executed = false;
+                let execPrice = 0;
+
+                if (price >= open) {
+                    executed = true;
+                    execPrice = open;
+                } else if (low <= price) {
+                    executed = true;
+                    execPrice = price;
+                }
+
+                if (executed) {
+                    // 설정된 분할 횟수 이내인 경우만 실제 체결
+                    if (idx < p_splitBuy) {
+                        let reqAmount = execPrice * unitQtyBuy * feeMultiplier;
+                        
+                        if (tempCash >= reqAmount) {
+                            tempCash -= reqAmount;
+                            
+                            dailyBuyCount++;
+                            dailyBuyQty += unitQtyBuy;
+                            dailyBuyAmt += reqAmount;
+                        } else {
+                            dailyFailCount++;
+                        }
+                    } else {
+                        // 범위를 벗어난 체결 가능 건수 (이탈 횟수 증가)
+                        dailyBuyMiss++;
+                    }
+                }
+            }
         }
 
-        console.log(`[Bulk Simulation] 완료: 총 ${count}건 저장`);
-        res.json({ success: true, count });
+        // ----------------------------------------------------------------
+        // 2. 매도 계산 (Sell Calculation) - NPER Logic 적용
+        // ----------------------------------------------------------------
+        if (prevShares > 0) {
+            let sellStartPrice = (prevUpper * (1 + p_gapSellPct)) / prevShares;
+
+            // [NPER 계산] 매도 가능 최대 횟수 계산 (High 도달 기준)
+            let maxSellLoops = 0;
+            if (high > sellStartPrice && p_gapSellPct > 0) {
+                // formula: high = start * (1 + gap)^n
+                maxSellLoops = Math.floor(Math.log(high / sellStartPrice) / Math.log(1 + p_gapSellPct)) + 1;
+            }
+
+            const loopLimitSell = Math.max(p_splitSell, maxSellLoops);
+
+            let currentTarget = sellStartPrice;
+            let sellTargets = [];
+
+            for (let k = 0; k < loopLimitSell; k++) {
+                sellTargets.push({ price: currentTarget, index: k });
+                currentTarget = currentTarget * (1 + p_gapSellPct);
+            }
+
+            // 오름차순 정렬
+            sellTargets.sort((a, b) => a.price - b.price);
+
+            for (let item of sellTargets) {
+                const price = item.price;
+                const idx = item.index;
+
+                let executed = false;
+                let execPrice = 0;
+
+                if (price <= open) {
+                    executed = true;
+                    execPrice = open;
+                } else if (high >= price) {
+                    executed = true;
+                    execPrice = price;
+                }
+
+                if (executed) {
+                    if (idx < p_splitSell) {
+                        if (tempShares > 0) {
+                            // 잔량 처리
+                            let currentSellQty = unitQtySell;
+                            if (tempShares < unitQtySell) {
+                                currentSellQty = tempShares;
+                            }
+                            tempShares -= currentSellQty;
+
+                            let profit = currentSellQty * (execPrice - currentAvgPrice);
+                            let tax = profit > 0 ? profit * tRate : 0;
+                            let sellAmount = (currentSellQty * execPrice) * (1 - fRate) - tax;
+
+                            dailySellCount++;
+                            dailySellQty += currentSellQty;
+                            dailySellAmt += sellAmount;
+                            dailyProfit += profit;
+                            dailyTax += tax;
+                        }
+                    } else {
+                        // 설정 범위를 초과하여 상승한 경우
+                        dailySellMiss++;
+                    }
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // 자산 및 수량 업데이트
+        // ----------------------------------------------------------------
+        
+        // 최종 보유 수량 계산 (daily 변수 사용)
+        shares = prevShares + dailyBuyQty - dailySellQty;
+
+        // 현금 잔고 계산
+        startCash = prevCash; 
+        cash = startCash - dailyBuyAmt + dailySellAmt - dailyWithdrawal;
+
+        const asset = cash + (shares * close);
+        const evalAmt = shares * close;
+        
+        // [평단가(totalPurchaseAmt) 업데이트]
+        // 매도 발생 시 평단가 금액 비례 차감
+        if (dailySellQty > 0 && prevShares > 0) {
+            totalPurchaseAmt -= (dailySellQty * (totalPurchaseAmt / prevShares));
+        }
+        // 매수 발생 시 실제 매수 금액 추가 (수수료 포함된 금액)
+        if (dailyBuyQty > 0) {
+            totalPurchaseAmt += dailyBuyAmt;
+        }
+
+        // [회복기간 계산]
+        let currentRecoveryDays = 0;
+        if (asset > highAsset) {
+            highAsset = asset;
+            lastHighAssetDayIdx = i;
+            currentRecoveryDays = 0;
+        } else {
+            const recoveryDays = i - lastHighAssetDayIdx;
+            if (recoveryDays > maxRecoveryDays) {
+                maxRecoveryDays = recoveryDays;
+            }
+            currentRecoveryDays = recoveryDays;
+        }
+
+        const mdd = highAsset > 0 ? ((asset - highAsset) / highAsset * 100) : 0;
+        if (mdd < maxMddRate) maxMddRate = mdd;
+
+        // 상태 업데이트
+        totalFailCount += dailyFailCount;
+        totalWithdrawal += dailyWithdrawal;
+        totalBuyAmt += dailyBuyAmt;
+        totalSellAmt += dailySellAmt;
+        totalProfit += dailyProfit;
+        totalTax += dailyTax;
+        totalFee += (dailyBuyAmt + dailySellAmt) / feeMultiplier;
+
+        last_asset = asset;
+        last_curLower = curLower;
+        last_curUpper = curUpper;
+        const stockRatio = shares > 0 ? (shares * close) / asset * 100 : 0;
+        const avgPrice = shares > 0 ? totalPurchaseAmt / shares : 0;
+
+        // [추가] 통계 누적
+        totalBuyCount += dailyBuyCount;
+        totalSellCount += dailySellCount;
+        totalBuyAlarmCount += isBuyAlarm;
+        totalSellAlarmCount += isSellAlarm;
+        sumStockRatio += stockRatio;
+        sumMDD += mdd;
+        sumAsset += asset;
+
+        // [신규] 통계 누적
+        if (stockRatio > maxStockRatio) maxStockRatio = stockRatio;
+        if (stockRatio < minStockRatio) minStockRatio = stockRatio;
+        totalBuyMissCount += dailyBuyMiss;
+        totalSellMissCount += dailySellMiss;
+
+        // ------------------------------------------------------------------
+        // [데이터 저장]
+        // ------------------------------------------------------------------
+        if (rType === 1) {
+            rows.push({
+                date: dateStr,
+                asset, mdd,
+                stockRatio, avgPrice,
+                failCount: dailyFailCount,
+                
+                open, high, low, close,
+                startCash, 
+                sAmt: dailySellAmt, 
+                bAmt: dailyBuyAmt,  
+                withdrawal: dailyWithdrawal,
+                finalCash: cash,
+                curLower, curUpper, vTarget, diffDays, unitQtyBuy, unitQtySell,
+                totalPurchaseAmt, evalAmt,
+                
+                buyQty: dailyBuyQty,
+                sellQty: dailySellQty,
+                buyCount: dailyBuyCount,
+                sellCount: dailySellCount,
+                
+                profit: dailyProfit,
+                tax: dailyTax,
+                
+                buyAlarm: isBuyAlarm,
+                sellAlarm: isSellAlarm,
+
+                // [요청 반영] 일자별 상세 데이터에 추가
+                buyMiss: dailyBuyMiss,
+                sellMiss: dailySellMiss,
+                recoveryDays: currentRecoveryDays
+            });
+
+            chartData.labels.push(dateStr);
+            chartData.ev.push(Math.round(shares * close));
+            chartData.vB.push(Math.round(vTarget)); 
+            chartData.vU.push(Math.round(curUpper)); 
+            chartData.vL.push(Math.round(curLower)); 
+        } 
+        else if (rType === 2) {
+            chartArrays.dates.push(dateStr);
+            chartArrays.assets.push(Math.round(asset));
+            chartArrays.closes.push(close);
+            chartArrays.mdds.push(Math.round(mdd * 100) / 100);
+            chartArrays.shares.push(shares);
+            chartArrays.lowers.push(Math.round(curLower));
+            chartArrays.uppers.push(Math.round(curUpper));
+            chartArrays.ratios.push(Math.round(stockRatio * 10) / 10);
+        }
+        else if (rType === 3) {
+            if (i >= startRecordingIdx) {
+                recentHistory.push({
+                    date: dateStr,
+                    close: close,
+                    open: open,
+                    high: high,
+                    low: low,
+                    asset: Math.round(asset),
+                    stockRatio: Math.round(stockRatio * 10) / 10,
+                    shares: shares,
+                    curLower: Math.round(curLower),
+                    curUpper: Math.round(curUpper)
+                });
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // [추가] 년도별 요약 데이터 계산 (Loop 마지막)
+        // ----------------------------------------------------------------
+        const currentYear = new Date(day.date).getFullYear();
+        let isYearEnd = false;
+        
+        // 마지막 데이터이거나, 다음 데이터의 년도가 다를 경우
+        if (i === priceData.length - 1) {
+            isYearEnd = true;
+        } else {
+            const nextYear = new Date(priceData[i+1].date).getFullYear();
+            if (nextYear !== currentYear) {
+                isYearEnd = true;
+            }
+        }
+
+        if (isYearEnd) {
+            const diffYearsCurrent = (new Date(day.date) - new Date(priceData[0].date)) / (1000 * 60 * 60 * 24 * 365.25);
+            // 최초 투자금(initCashVal) 대비 현재 자산 기준 CAGR
+            const currentCagr = (diffYearsCurrent > 0 && asset > 0) 
+                ? (Math.pow((asset / initCashVal), (1 / diffYearsCurrent)) - 1) * 100 
+                : 0;
+
+            const currentTotalDays = i + 1;
+            const currentAvgStockRatio = currentTotalDays > 0 ? sumStockRatio / currentTotalDays : 0;
+            const currentAvgMDD = currentTotalDays > 0 ? sumMDD / currentTotalDays : 0;
+            const currentAvgAsset = currentTotalDays > 0 ? sumAsset / currentTotalDays : 0;
+
+            // [요청 반영] 년도별 통계에도 lastStatus 항목 모두 추가
+            const curCumulativeReturn = ((asset - initCashVal) / initCashVal) * 100;
+            const curRiskRewardRatio = maxMddRate !== 0 ? Math.abs(currentCagr / maxMddRate) : 0;
+
+            const curBuyFillRate = (totalBuyCount + totalBuyMissCount) > 0 
+                ? totalBuyCount / (totalBuyCount + totalBuyMissCount) 
+                : 0;
+            
+            const curSellFillRate = (totalSellCount + totalSellMissCount) > 0 
+                ? totalSellCount / (totalSellCount + totalSellMissCount) 
+                : 0;
+
+            const curDailyTurnoverFreq = currentTotalDays > 0 ? (totalBuyCount + totalSellCount) / currentTotalDays : 0;
+            
+            const curTotalTurnoverRate = (currentAvgAsset > 0) 
+                ? ((totalBuyAmt + totalSellAmt) / 2) / currentAvgAsset 
+                : 0;
+            
+            const curBuyAlarmRate = currentTotalDays > 0 ? totalBuyAlarmCount / currentTotalDays : 0;
+            const curSellAlarmRate = currentTotalDays > 0 ? totalSellAlarmCount / currentTotalDays : 0;
+
+            yearlyReturns.push({
+                date: dateStr,
+                asset: asset,
+                stockRatio: stockRatio,
+                avgPrice: avgPrice,
+                shares: shares,
+                curLower: curLower,
+                curUpper: curUpper,
+                // 누적 통계치
+                max_mdd_rate: maxMddRate, 
+                final_cagr: currentCagr,
+                total_fail_count: totalFailCount,
+                total_Withdrawal: totalWithdrawal,
+                total_BuyAmt: totalBuyAmt,
+                total_SellAmt: totalSellAmt,
+                total_Profit: totalProfit,
+                total_Tax: totalTax, 
+                total_Fee: totalFee,
+                total_BuyCount: totalBuyCount,
+                total_SellCount: totalSellCount,
+                total_BuyAlarmCount: totalBuyAlarmCount,
+                total_SellAlarmCount: totalSellAlarmCount,
+                total_days: currentTotalDays,
+                avg_StockRatio: currentAvgStockRatio,
+                avg_MDD: currentAvgMDD,
+
+                // [신규 추가 항목 - 년도별]
+                cumulativeReturn: curCumulativeReturn,
+                maxRecoveryDays: maxRecoveryDays,
+                riskRewardRatio: curRiskRewardRatio,
+                maxStockRatio: maxStockRatio,
+                minStockRatio: minStockRatio,
+                buyRangeMissCount: totalBuyMissCount,
+                sellRangeMissCount: totalSellMissCount,
+                buyFillRate: curBuyFillRate,
+                sellFillRate: curSellFillRate,
+                dailyTurnoverFreq: curDailyTurnoverFreq,
+                totalTurnoverRate: curTotalTurnoverRate,
+                buyAlarmRate: curBuyAlarmRate,
+                sellAlarmRate: curSellAlarmRate
+            });
+        }
+    }
+
+    // 최종 요약본 생성
+    // [수정] 루프 밖에서 사용할 마지막 날짜 계산
+    const lastDayData = priceData[priceData.length - 1];
+    const lastDateStr = lastDayData.date instanceof Date 
+        ? lastDayData.date.toISOString().split('T')[0] 
+        : String(lastDayData.date).split('T')[0];    
+        
+    const lastRow = (rows && rows.length > 0) ? rows[rows.length - 1] : {
+        date: lastDateStr, // [수정] dateStr -> lastDateStr 로 변경
+        asset: last_asset,
+        stockRatio: (shares * priceData[priceData.length-1].close_price) / last_asset * 100,
+        avgPrice: shares > 0 ? totalPurchaseAmt / shares : 0,
+        shares: shares,
+        curLower: last_curLower,
+        curUpper: last_curUpper
+    };
+
+    const diffTotalYears = (new Date(priceData[priceData.length-1].date) - new Date(priceData[0].date)) / (1000 * 60 * 60 * 24 * 365.25);
+    const finalCagr = (diffTotalYears > 0 && last_asset > 0) 
+        ? (Math.pow((last_asset / initCashVal), (1 / diffTotalYears)) - 1) * 100 
+        : 0;
+
+    // [추가] 평균값 및 신규 통계 계산
+    const totalDays = priceData.length;
+    const avgStockRatio = totalDays > 0 ? sumStockRatio / totalDays : 0;
+    const avgMDD = totalDays > 0 ? sumMDD / totalDays : 0;
+    const avgAsset = totalDays > 0 ? sumAsset / totalDays : 0;
+
+    // 신규 항목 계산
+    const cumulativeReturn = ((last_asset - initCashVal) / initCashVal) * 100;
+    const riskRewardRatio = maxMddRate !== 0 ? Math.abs(finalCagr / maxMddRate) : 0; 
+    
+    const buyFillRate = (totalBuyCount + totalBuyMissCount) > 0 
+        ? totalBuyCount / (totalBuyCount + totalBuyMissCount) 
+        : 0;
+    
+    const sellFillRate = (totalSellCount + totalSellMissCount) > 0 
+        ? totalSellCount / (totalSellCount + totalSellMissCount) 
+        : 0;
+        
+    const dailyTurnoverFreq = totalDays > 0 ? (totalBuyCount + totalSellCount) / totalDays : 0;
+    
+    // 총 회전율 = (매수 + 매도) / 2 / 평잔
+    const totalTurnoverRate = (avgAsset > 0) 
+        ? ((totalBuyAmt + totalSellAmt) / 2) / avgAsset 
+        : 0;
+
+    const buyAlarmRate = totalDays > 0 ? totalBuyAlarmCount / totalDays : 0;
+    const sellAlarmRate = totalDays > 0 ? totalSellAlarmCount / totalDays : 0;
+
+
+    return { 
+        rows, 
+        chartData, 
+        chartArrays: (rType === 2 ? chartArrays : null),
+        recentHistory: (rType === 3 ? recentHistory : null),
+        yearlyReturns,
+        lastStatus: { 
+            ...lastRow, 
+            max_mdd_rate: maxMddRate,
+            final_cagr: finalCagr,
+            total_fail_count: totalFailCount,
+            total_Withdrawal: totalWithdrawal,
+            total_BuyAmt: totalBuyAmt,
+            total_SellAmt: totalSellAmt,
+            total_Profit: totalProfit,
+            total_Tax: totalTax, 
+            total_Fee: totalFee,
+            total_BuyCount: totalBuyCount,
+            total_SellCount: totalSellCount,
+            total_BuyAlarmCount: totalBuyAlarmCount,
+            total_SellAlarmCount: totalSellAlarmCount,
+            total_days: totalDays,
+            avg_StockRatio: avgStockRatio,
+            avg_MDD: avgMDD,
+            
+            // [요청 추가 항목]
+            cumulativeReturn,       // 누적수익율
+            maxRecoveryDays,        // 최대회복기간
+            riskRewardRatio,        // 위험보상비율
+            
+            maxStockRatio,          // 최대주식비중
+            minStockRatio,          // 최소주식비중
+            
+            buyRangeMissCount: totalBuyMissCount,   // 매수범위이탈횟수
+            sellRangeMissCount: totalSellMissCount, // 매도범위이탈횟수
+            
+            buyFillRate,            // 매수체결률
+            sellFillRate,           // 매도체결률
+            dailyTurnoverFreq,      // 일평균 매매빈도
+            totalTurnoverRate,      // 총 회전율
+            
+            buyAlarmRate,           // 매수알림률
+            sellAlarmRate           // 매도알림률
+        }
+    };
+}
+
+// [API] 병렬 처리 일괄 실행 (등급별 속도 제어 적용)
+app.post('/api/simulation-compare-batch', verifyToken, logTraffic, async (req, res) => {
+    try {
+        const { strategies, startDate, endDate, responseType } = req.body;
+        const reqType = responseType || 1;
+
+        if (!strategies || strategies.length === 0) {
+            return res.status(400).json({ success: false, error: "전략 리스트가 없습니다." });
+        }
+
+        // ============================================================
+        // [비즈니스 로직] 등급별 처리 속도 설정 (Throttling Config)
+        // ============================================================
+        const userRole = req.user.role || 'G1';
+        const isVip = ['G9', 'admin'].includes(userRole);
+
+        // VIP: 한 번에 50개씩 병렬 처리, 대기시간 없음
+        // 일반(G1): 한 번에 5개씩 병렬 처리, 배치 사이 500ms(0.5초) 지연
+        const BATCH_SIZE = isVip ? 50 : 5; 
+        const DELAY_MS = isVip ? 0 : 500; 
+
+        // ============================================================
+        // [데이터 준비] 티커별 데이터 선행 로드 (기존 로직 유지)
+        // ============================================================
+        const uniqueTickers = [...new Set(strategies.map(s => s.ticker))];
+        const priceDataMap = {};
+
+        // 티커 데이터는 병렬로 최대한 빠르게 확보 (병목 최소화)
+        await Promise.all(uniqueTickers.map(async (ticker) => {
+            const data = await getDailyStockData(ticker, startDate, endDate);
+            priceDataMap[ticker] = data || [];
+        }));
+
+        // ============================================================
+        // [핵심 로직] 배치 단위 실행 및 지연 처리
+        // ============================================================
+        
+        // 지연 처리를 위한 유틸 함수
+        const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        
+        const finalResults = []; // 전체 결과 저장소
+
+        // 전략 리스트를 BATCH_SIZE 만큼 잘라서 순차 처리
+        for (let i = 0; i < strategies.length; i += BATCH_SIZE) {
+            // 현재 처리할 묶음 (Chunk)
+            const chunk = strategies.slice(i, i + BATCH_SIZE);
+
+            // 해당 묶음 병렬 실행
+            const chunkPromises = chunk.map(async (strat) => {
+                const tickerData = priceDataMap[strat.ticker];
+                
+                // 데이터 없음 처리
+                if (!tickerData || tickerData.length === 0) {
+                    return { strategy_code: strat.strategy_code, success: false, message: "데이터 없음" };
+                }
+
+                // 시뮬레이션 실행
+                const simResult = await runSimulationInternal({ ...strat, responseType: reqType }, tickerData);
+
+                if (simResult) {
+                    const lastTicker = tickerData[tickerData.length - 1];
+                    
+                    const resultObj = {
+                        strategy_code: strat.strategy_code,
+                        success: true,
+                        tickerStats: {
+                            max: Math.max(...tickerData.map(d => d.close_price || 0)),
+                            last: Number(lastTicker.close_price),
+                            date: lastTicker.date
+                        },
+                        summary: simResult.lastStatus
+                    };
+
+                    // 요청 타입별 응답 데이터 구성
+                    if (reqType === 1) {
+                        resultObj.rows = simResult.rows;
+                        resultObj.chart = simResult.chartData;
+                    } else if (reqType === 2) {
+                        resultObj.chart = simResult.chartArrays;
+                        resultObj.recentHistory = simResult.recentHistory;
+                    } else if (reqType === 3) {
+                        resultObj.recentHistory = simResult.recentHistory;
+                    }
+                    return resultObj;
+                } else {
+                    return { strategy_code: strat.strategy_code, success: false, message: "시뮬레이션 실패" };
+                }
+            });
+
+            // 현재 배치의 결과 기다림
+            const batchResults = await Promise.all(chunkPromises);
+            finalResults.push(...batchResults);
+
+            // 마지막 배치가 아니고, 지연 시간이 설정되어 있다면 대기
+            if (i + BATCH_SIZE < strategies.length && DELAY_MS > 0) {
+                await sleep(DELAY_MS);
+            }
+        }
+
+        res.json({ success: true, results: finalResults });
 
     } catch (e) {
-        console.error("[Bulk Simulation Error]:", e);
+        console.error("Batch Simulation Error:", e);
         res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ============================================================
+// [신규 API] 티커 검색 및 필터링 (권한 제어 포함)
+// ============================================================
+// [수정] verifyToken 미들웨어 추가 (req.user 사용 가능해짐)
+app.post('/api/ticker/search', verifyToken, async (req, res) => {
+    try {
+        const { type, keyword, userGrade } = req.body;
+        
+        // [보안 강화] 토큰에서 직접 권한 확인 (위조 방지)
+        const tokenRole = req.user ? req.user.role : null;
+        const isAdmin = ['admin', 'G9'].includes(tokenRole);
+
+        // 1. [보안] 권한 체크 로직 수정
+        // 관리자(isAdmin)이거나, 프론트에서 VIP라고 보냈으면 통과
+        // 그 외(무료 유저)인 경우에만 제약 사항 체크
+        const isFreeUser = !isAdmin && (!userGrade || userGrade === 'FREE');
+
+        if (isFreeUser && type === '2') {
+            return res.status(403).json({ 
+                error: "무료 등급 회원은 ETF 리스트를 조회할 수 없습니다." 
+            });
+        }
+
+        // 2. Firestore에서 전체 티커 가져오기
+        const snapshot = await firestore.collection('tickers').get();
+        
+        const allTickers = snapshot.docs.map(doc => {
+            const fullData = doc.data();
+            const dataContent = fullData.metadata ? fullData.metadata : fullData;
+            return {
+                id: doc.id,
+                ...dataContent
+            };
+        });
+
+        // 3. 필터링 로직 실행
+        const filteredList = allTickers.filter(item => {
+            const tCode = (item.id || item.ticker || "").toUpperCase();
+            const isIndex = tCode.startsWith('^'); 
+
+            // [보안] 무료 유저는 검색(9)을 하더라도 '지수'만 보여줌
+            // 관리자는 모든 종목 검색 가능
+            if (isFreeUser) {
+                if (!isIndex) return false; 
+            }
+
+            // 구분자별 로직
+            if (type === '1') { // [지수]
+                return isIndex;
+            } 
+            else if (type === '2') { // [지수ETF]
+                return !isIndex;
+            } 
+            else if (type === '9') { // [검색]
+                if (!keyword) return false;
+                const searchKey = keyword.toUpperCase().trim();
+
+                const kName = (item.ticker_name_kr || "").toUpperCase();
+                const desc = (item.description || "").toUpperCase();
+                const und = (item.underlying_ticker || "").toUpperCase();
+
+                return tCode.includes(searchKey) ||
+                       kName.includes(searchKey) ||
+                       desc.includes(searchKey) ||
+                       und.includes(searchKey);
+            }
+            
+            return false;
+        });
+
+        // 4. 정렬
+        filteredList.sort((a, b) => {
+            const aId = (a.id || a.ticker).toUpperCase();
+            const bId = (b.id || b.ticker).toUpperCase();
+            return aId.localeCompare(bId);
+        });
+
+        // 실제 권한 로그 출력 (디버깅용)
+        console.log(`[Ticker Search] Type:${type}, Key:${keyword}, Role:${tokenRole}, Grade:${userGrade} -> Result:${filteredList.length}건`);
+        
+        res.json(filteredList);
+
+    } catch (e) {
+        console.error("Search API Error:", e);
+        res.status(500).json({ error: "검색 중 오류가 발생했습니다." });
     }
 });
 
@@ -1070,91 +2235,11 @@ app.post('/api/send-common-email', async (req, res) => {
     }
 });
 
-// [수정] 전략 설정과 결과를 통합하여 데이터 반환 (Firestore)
-app.post('/api/get-analysis-data', async (req, res) => {
-    const { strategyCodes, startDate, endDate } = req.body;
-
-    try {
-        console.log(`[Analysis Data] Fetching for strategies: ${strategyCodes}`);
-
-        // 1. 전략 설정(strategies) 정보 가져오기
-        // WHERE IN 쿼리는 Firestore에서 FieldPath.documentId()와 'in' 연산자로 처리 가능 (최대 30개 제한)
-        const strategiesSnapshot = await firestore.collection('strategies')
-            .where(admin.firestore.FieldPath.documentId(), 'in', strategyCodes)
-            .get();
-
-        if (strategiesSnapshot.empty) {
-            return res.json({ success: true, data: [] });
-        }
-
-        // 전략 정보를 맵(Map) 형태로 저장 (빠른 조인을 위함)
-        const strategyMap = {};
-        strategiesSnapshot.forEach(doc => {
-            strategyMap[doc.id] = doc.data();
-        });
-
-        // 2. 시뮬레이션 결과(simulation_results) 가져오기
-        const resultsRef = firestore.collection('simulation_results');
-        const resultsSnapshot = await resultsRef
-            .where('strategy_code', 'in', strategyCodes)
-            .where('start_date', '>=', startDate)
-            .where('start_date', '<=', endDate)
-            .get();
-
-        // 3. 데이터 조인 및 CAGR 계산
-        const processed = resultsSnapshot.docs.map(doc => {
-            const resultData = doc.data();
-            const strategyData = strategyMap[resultData.strategy_code] || {};
-
-            // 날짜 계산 (CAGR용)
-            const start = new Date(resultData.start_date);
-            const end = new Date(resultData.end_date);
-            const diffDays = Math.max(1, (end - start) / (1000 * 60 * 60 * 24));
-
-            // 연복리 수익률(CAGR) 공식 적용
-            // 기초자산(init_cash)은 전략 설정 정보에 있음
-            const initCash = strategyData.init_cash || 1; 
-            const cagr = (Math.pow(resultData.end_asset / initCash, 365 / diffDays) - 1) * 100;
-
-            return {
-                // 결과 데이터와 전략 설정을 하나로 합침 (MySQL JOIN 효과)
-                strategy_code: resultData.strategy_code,
-                ticker: strategyData.ticker,
-                init_cash: strategyData.init_cash,
-                init_stock: strategyData.init_stock,
-                target_rate: strategyData.target_rate,
-                upperRate: strategyData.upperRate, // 사용자 변수명 준수
-                lowerRate: strategyData.lowerRate, // 사용자 변수명 준수
-                unit_gap: strategyData.unit_gap,
-                
-                start_date: resultData.start_date,
-                end_date: resultData.end_date,
-                end_asset: resultData.end_asset,
-                end_stock_rate: resultData.end_stock_rate,
-                max_mdd_rate: resultData.max_mdd_rate,
-                average_price: resultData.average_price,
-                
-                cagr: parseFloat(cagr.toFixed(2)),
-                startDateStr: resultData.start_date // 이미 YYYY-MM-DD 형태라면 그대로 사용
-            };
-        });
-
-        // 시작일 기준 오름차순 정렬
-        processed.sort((a, b) => a.start_date.localeCompare(b.start_date));
-
-        res.json({ success: true, data: processed });
-
-    } catch (e) {
-        console.error("[Analysis Data Error]:", e);
-        res.status(500).json({ success: false, error: e.message });
-    }
-});
-
 /**
  * [추가] 야후 파이낸스 티커 정보 조회 API (프록시)
  * 프론트엔드에서 티커 유효성 검사 및 자동 명칭 완성을 위해 호출함
  */
-app.get('/api/proxy/yahoo-info', async (req, res) => {
+app.get('/api/proxy/yahoo-info', verifyToken, async (req, res) => {
     const { ticker } = req.query;
     if (!ticker) return res.status(400).json({ error: "티커 코드가 필요합니다." });
 
@@ -1178,6 +2263,531 @@ app.get('/api/proxy/yahoo-info', async (req, res) => {
         res.status(404).json({ error: "유효하지 않은 티커입니다." });
     }
 });
+
+// [하이브리드] FMP(최신 30년) + Yahoo(그 이전) 합쳐서 저장하기
+// 핵심 수정: 'verifyToken' 추가 (이게 있어야 req.user.email을 읽을 수 있음)
+app.post('/api/load-hybrid-data', verifyToken, async (req, res) => {
+  const { symbol } = req.body; 
+
+  // [안전장치] 토큰이 있어도 혹시 유저 정보가 없을 때를 대비
+  const userEmail = req.user ? req.user.email : 'Unknown_User';
+  console.log(`[User: ${userEmail}] 종목 [${symbol}] 데이터 수집 요청`);
+  
+  if (!symbol) {
+    return res.status(400).json({ error: 'Symbol이 필요합니다.' });
+  }
+
+  try {
+    let finalData = [];
+    
+    // -------------------------------------------------------
+    // 1. FMP 데이터 가져오기 (Main Source)
+    // -------------------------------------------------------
+    console.log(`1. FMP에서 [${symbol}] 데이터 요청 중...`);
+    
+    let fmpRes;
+    try {
+        fmpRes = await fmpClient.get(`/historical-price-full/${symbol}`);
+    } catch (fmpErr) {
+        // FMP 에러가 나도 서버가 죽지 않게 잡아서 로그를 찍고 500 에러를 던짐
+        const status = fmpErr.response ? fmpErr.response.status : 'Unknown';
+        console.error(`FMP 호출 에러 (${status}):`, fmpErr.message);
+        throw new Error(`FMP 데이터 수신 실패 (Status: ${status}). 구독 상태를 확인하세요.`);
+    }
+    
+    // 데이터가 비어있을 경우 처리
+    if (!fmpRes.data.historical || fmpRes.data.historical.length === 0) {
+      throw new Error(`FMP에 [${symbol}] 데이터가 존재하지 않습니다.`);
+    }
+
+    // 최신순 -> 과거순 정렬
+    const fmpData = fmpRes.data.historical.reverse();
+    const fmpStartDate = fmpData[0].date; 
+
+    console.log(`>> FMP 데이터 확보: ${fmpStartDate} ~ 현재 (${fmpData.length}일)`);
+
+    // -------------------------------------------------------
+    // 2. Yahoo 데이터 가져오기 (Gap Filling)
+    // -------------------------------------------------------
+    try {
+      console.log(`2. Yahoo에서 [${fmpStartDate}] 이전 데이터 요청 중...`);
+      
+      const yahooResult = await yahooFinance.historical(symbol, {
+        period1: '1900-01-01', 
+        period2: fmpStartDate, 
+        interval: '1d'
+      });
+
+      if (yahooResult && yahooResult.length > 0) {
+        const yahooMapped = yahooResult.map(item => ({
+          date: item.date.toISOString().split('T')[0],
+          open: item.open,
+          high: item.high,
+          low: item.low,
+          close: item.close,
+          adjClose: item.adjClose,
+          volume: item.volume,
+          source: 'yahoo' 
+        }));
+        
+        console.log(`>> Yahoo 데이터 확보: ${yahooMapped.length}일 추가 성공`);
+        finalData = [...yahooMapped, ...fmpData];
+      } else {
+        console.log('>> Yahoo 데이터가 없거나 가져올 필요가 없습니다.');
+        finalData = fmpData;
+      }
+    } catch (yahooError) {
+      console.warn('>> Yahoo 연결 실패 (FMP 데이터만 저장합니다):', yahooError.message);
+      finalData = fmpData; 
+    }
+
+    // -------------------------------------------------------
+    // 3. Firestore에 저장 (Batch 처리)
+    // -------------------------------------------------------
+    console.log(`3. 총 ${finalData.length}건 데이터 저장 시작...`);
+    
+    const batchSize = 400; 
+    let batch = admin.firestore().batch();
+    let count = 0;
+    let totalSaved = 0;
+
+    for (const dayData of finalData) {
+        const docRef = admin.firestore()
+            .collection('stocks')
+            .doc(symbol)
+            .collection('history')
+            .doc(dayData.date); 
+
+        // undefined 값 제거 (JSON 직렬화/역직렬화 꼼수 사용)
+        const safeData = JSON.parse(JSON.stringify(dayData));
+        batch.set(docRef, safeData);
+
+        count++;
+        if (count >= batchSize) {
+            await batch.commit();
+            totalSaved += count;
+            console.log(`>> 저장 중... (${totalSaved}/${finalData.length})`);
+            batch = admin.firestore().batch();
+            count = 0;
+        }
+    }
+
+    if (count > 0) {
+        await batch.commit();
+        totalSaved += count;
+    }
+
+    // 성공 응답
+    res.json({
+      message: '데이터 수집 완료',
+      symbol: symbol,
+      totalDays: totalSaved,
+      range: `${finalData[0].date} ~ ${finalData[finalData.length-1].date}`
+    });
+
+  } catch (error) {
+    console.error(`[최종 에러] ${symbol} 수집 실패:`, error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ======================================================================
+// FMP API -   시작
+// ======================================================================
+
+// ======================================================================
+// [핵심 로직] FMP 전체 종목 리스트 가져와서 '거래소별'로 묶어 저장하기 (안전 버전)
+// ======================================================================
+app.post('/api/sync-ticker-master', verifyToken, async (req, res) => {
+  try {
+    console.log('1. FMP에서 전체 종목 리스트 다운로드 중... (시간이 좀 걸립니다)');
+    
+    // FMP: 거래 가능한 모든 티커 (약 6만 개 내외)
+    const response = await fmpClient.get('/available-traded/list');
+    const allTickers = response.data;
+    
+    console.log(`>> 데이터 수신 완료! 총 ${allTickers.length}개의 종목을 정리합니다.`);
+
+    // 2. 거래소별 그룹핑 (Grouping)
+    const groupedData = {};
+
+    allTickers.forEach(item => {
+        // 필수 정보 없는 쓰레기 데이터 제외
+        if (!item.symbol || !item.name) return;
+
+        // 거래소 이름 확인 (없으면 OTC)
+        let exchange = item.exchangeShortName || 'OTC';
+        
+        // 특수문자 제거 (Firestore 문서 ID 규칙 준수)
+        // 예: "TSX-V" -> "TSX_V" 등
+        exchange = exchange.replace(/\//g, '_').replace(/\./g, '');
+
+        // 국가 코드 매핑 (기본 US, 한국은 KR)
+        let country = 'US'; 
+        if (['KSE', 'KOSDAQ', 'KOE'].includes(exchange)) country = 'KR';
+        if (['HKSE', 'HKG'].includes(exchange)) country = 'HK'; // 홍콩 등 필요시 추가
+        if (['SHA', 'SHZ'].includes(exchange)) country = 'CN'; // 중국
+
+        const docId = `${country}_${exchange}`;
+
+        if (!groupedData[docId]) {
+            groupedData[docId] = [];
+        }
+
+        // 최소 정보만 저장 (symbol, name)
+        groupedData[docId].push({
+            s: item.symbol, 
+            n: item.name    
+        });
+    });
+
+    console.log(`2. 그룹핑 완료. 총 ${Object.keys(groupedData).length}개의 거래소 그룹이 생성됨.`);
+
+    // 3. Firestore 저장 (Batch 500개 제한 준수)
+    const collectionRef = admin.firestore().collection('meta_tickers');
+    let batch = admin.firestore().batch();
+    let operationCount = 0;
+    let totalSavedGroups = 0;
+    
+    for (const [docId, tickerList] of Object.entries(groupedData)) {
+        const docRef = collectionRef.doc(docId);
+        
+        // 한 문서당 용량 제한(1MB) 고려하여 최대 8000개까지만 저장
+        // (미국 주요 거래소 외에는 8000개 넘는 경우가 거의 없음)
+        const safeList = tickerList.slice(0, 8000); 
+
+        batch.set(docRef, {
+            country: docId.split('_')[0],
+            exchange: docId.split('_')[1],
+            count: safeList.length,
+            updatedAt: new Date().toISOString(),
+            list: safeList
+        });
+        
+        operationCount++;
+        totalSavedGroups++;
+
+        // 500개 차면 저장하고 비우기 (Firestore 제한)
+        if (operationCount >= 400) { // 여유 있게 400에서 끊음
+            await batch.commit();
+            console.log(`>> 중간 저장 완료... (${totalSavedGroups}개 그룹)`);
+            batch = admin.firestore().batch();
+            operationCount = 0;
+        }
+    }
+
+    // 남은 잔여 데이터 최종 저장
+    if (operationCount > 0) {
+        await batch.commit();
+    }
+
+    console.log(`3. 최종 완료! 총 ${totalSavedGroups}개의 거래소 문서가 저장되었습니다.`);
+    
+    res.json({
+        message: '티커 마스터 동기화 성공',
+        totalExchanges: totalSavedGroups,
+        totalTickers: allTickers.length,
+        example: Object.keys(groupedData).slice(0, 5)
+    });
+
+  } catch (error) {
+    console.error('티커 동기화 실패:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// [기능 2] 주요 지수(S&P500, Nasdaq100) 및 ETF 마스터 동기화
+// ============================================================
+app.post('/api/sync-index-master', verifyToken, async (req, res) => {
+    try {
+        console.log(`[Master Sync] 주요 지수 구성종목 및 ETF 업데이트 시작... (User: ${req.user.email})`);
+
+        const collectionRef = admin.firestore().collection('meta_tickers');
+        const batch = admin.firestore().batch();
+        let logMsg = [];
+
+        // -------------------------------------------------
+        // 1. S&P 500 구성종목 가져오기
+        // -------------------------------------------------
+        try {
+            const sp500Res = await fmpClient.get('/sp500_constituent');
+            const sp500Data = sp500Res.data.map(item => ({ s: item.symbol, n: item.name, sec: item.sector }));
+            
+            batch.set(collectionRef.doc('US_SP500'), {
+                country: 'US',
+                exchange: 'SP500',
+                description: 'S&P 500 구성종목',
+                count: sp500Data.length,
+                updatedAt: new Date().toISOString(),
+                list: sp500Data
+            });
+            logMsg.push(`S&P500 (${sp500Data.length}개)`);
+        } catch (e) {
+            console.error("S&P500 실패:", e.message);
+        }
+
+        // -------------------------------------------------
+        // 2. NASDAQ 100 구성종목 가져오기
+        // -------------------------------------------------
+        try {
+            const ndxRes = await fmpClient.get('/nasdaq_constituent');
+            const ndxData = ndxRes.data.map(item => ({ s: item.symbol, n: item.name, sec: item.sector }));
+
+            batch.set(collectionRef.doc('US_NASDAQ100'), {
+                country: 'US',
+                exchange: 'NASDAQ100',
+                description: 'NASDAQ 100 구성종목',
+                count: ndxData.length,
+                updatedAt: new Date().toISOString(),
+                list: ndxData
+            });
+            logMsg.push(`NASDAQ100 (${ndxData.length}개)`);
+        } catch (e) {
+            console.error("NASDAQ100 실패:", e.message);
+        }
+
+        // -------------------------------------------------
+        // 3. [업그레이드] 핵심 ETF 리스트 가져오기 (Smart Filtering)
+        // -------------------------------------------------
+        try {
+            console.log("[Master Sync] 유동성 풍부한 ETF 선별 중...");
+            
+            // [변경] 단순 리스트 대신 '스크리너' 사용
+            // 조건: ETF이면서 + 거래량(volume)이 50만 주 이상 + 주요 거래소
+            const etfRes = await fmpClient.get('/stock-screener', {
+                params: {
+                    isEtf: true,
+                    volumeMoreThan: 200000, // 일일 거래량 50만 주 이상 (유동성 필터)
+                    exchange: 'NASDAQ,NYSE,AMEX' // 주요 거래소만
+                }
+            });
+            
+            // 필요한 필드만 추출
+            const etfData = etfRes.data.map(item => ({ 
+                s: item.symbol, 
+                n: item.companyName, // screener는 'companyName' 필드를 씁니다
+                sec: item.sector,    // 섹터 정보도 챙기면 좋음 (Technology 등)
+                ind: item.industry   // 산업군 정보
+            }));
+
+            // 혹시 모르니 심볼 기준 정렬
+            etfData.sort((a, b) => a.s.localeCompare(b.s));
+
+            // Firestore 저장 (문서 ID: US_ETF_MAJOR 로 변경 추천)
+            batch.set(collectionRef.doc('US_ETF'), {
+                country: 'US',
+                exchange: 'ETF',
+                description: '미국 주요 유동성 ETF (Vol > 500k)',
+                count: etfData.length,
+                updatedAt: new Date().toISOString(),
+                list: etfData
+            });
+            logMsg.push(`핵심ETF (${etfData.length}개)`);
+        } catch (e) {
+            console.error("ETF 필터링 실패:", e.message);
+            // 실패 시 비상용으로 기존 단순 리스트 로직을 태우거나 에러 처리
+        }
+
+        // DB 저장 실행
+        await batch.commit();
+
+        console.log(`[Master Sync] 완료: ${logMsg.join(', ')}`);
+        res.json({ success: true, message: `동기화 완료: ${logMsg.join(', ')}` });
+
+    } catch (error) {
+        console.error("Index Sync Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// [기능 3] 상장폐지 종목 마스터 동기화 (Delisted Companies)
+// ============================================================
+app.post('/api/sync-delisted-master', verifyToken, async (req, res) => {
+    try {
+        console.log(`[Delisted Sync] 상장폐지 종목 리스트 요청... (User: ${req.user.email})`);
+        
+        // FMP API 호출 (페이징이 있는 경우도 있으나, 전체 리스트 엔드포인트 사용)
+        const response = await fmpClient.get('/delisted-companies');
+        const delistedData = response.data;
+
+        console.log(`>> 수신 완료: 총 ${delistedData.length}개 종목`);
+
+        const batch = admin.firestore().batch();
+        const collectionRef = admin.firestore().collection('meta_delisted');
+        
+        // 데이터가 많으므로(수만 건) 최신 5,000개 또는 주요 종목만 저장하거나
+        // 배치 처리를 여러 번 나눠서 해야 하지만, 여기선 최신 2000개만 샘플로 저장 (안전장치)
+        const limitData = delistedData.slice(0, 2000); 
+
+        // 기존 데이터 덮어쓰기 위해 문서 ID는 Symbol 사용
+        limitData.forEach(item => {
+            if (!item.symbol) return;
+            const docRef = collectionRef.doc(item.symbol);
+            batch.set(docRef, {
+                symbol: item.symbol,
+                name: item.companyName,
+                exchange: item.exchange,
+                delistedDate: item.delistedDate,
+                ipoDate: item.ipoDate,
+                updatedAt: new Date().toISOString()
+            });
+        });
+
+        await batch.commit();
+        res.json({ success: true, count: limitData.length });
+
+    } catch (error) {
+        console.error("Delisted Sync Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// [기능 4] 기업 이벤트 (배당, 분할) 수집
+// ============================================================
+app.post('/api/load-corporate-actions', verifyToken, async (req, res) => {
+    const { symbol } = req.body;
+    if (!symbol) return res.status(400).json({ error: 'Symbol required' });
+
+    try {
+        console.log(`[Actions] ${symbol} 배당 및 액면분할 정보 수집 중...`);
+        const batch = admin.firestore().batch();
+        let actionCount = 0;
+
+        // 1. 배당 정보 (Historical Dividends)
+        try {
+            const divRes = await fmpClient.get(`/historical-price-full/stock_dividend/${symbol}`);
+            if (divRes.data && divRes.data.historical) {
+                const dividends = divRes.data.historical.slice(0, 100); // 최근 100건만
+                
+                // stocks/{symbol}/dividends 컬렉션에 저장
+                dividends.forEach(d => {
+                    const docRef = admin.firestore()
+                        .collection('stocks').doc(symbol)
+                        .collection('dividends').doc(d.date); // 날짜를 ID로
+                    
+                    batch.set(docRef, {
+                        date: d.date,
+                        dividend: d.dividend,
+                        adjDividend: d.adjDividend,
+                        recordDate: d.recordDate,
+                        paymentDate: d.paymentDate,
+                        declarationDate: d.declarationDate
+                    });
+                    actionCount++;
+                });
+            }
+        } catch (e) { console.warn(`${symbol} 배당 정보 없음 또는 에러`); }
+
+        // 2. 액면분할 (Stock Splits)
+        try {
+            const splitRes = await fmpClient.get(`/historical-price-full/stock_split/${symbol}`);
+            if (splitRes.data && splitRes.data.historical) {
+                const splits = splitRes.data.historical;
+                
+                splits.forEach(s => {
+                    const docRef = admin.firestore()
+                        .collection('stocks').doc(symbol)
+                        .collection('splits').doc(s.date);
+                    
+                    batch.set(docRef, {
+                        date: s.date,
+                        numerator: s.numerator,
+                        denominator: s.denominator,
+                        ratio: `${s.numerator}:${s.denominator}`
+                    });
+                    actionCount++;
+                });
+            }
+        } catch (e) { console.warn(`${symbol} 분할 정보 없음`); }
+
+        if (actionCount > 0) await batch.commit();
+
+        res.json({ success: true, symbol, count: actionCount });
+
+    } catch (error) {
+        console.error(`[Actions Error] ${symbol}:`, error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// [기능 5] 재무제표 (Income, Balance, CashFlow) 및 프로필 수집
+// ============================================================
+app.post('/api/load-financials', verifyToken, async (req, res) => {
+    const { symbol } = req.body;
+    if (!symbol) return res.status(400).json({ error: 'Symbol required' });
+
+    try {
+        console.log(`[Financials] ${symbol} 재무제표 및 상세정보 수집 중...`);
+        const db = admin.firestore();
+        const batch = db.batch();
+
+        // 1. 기업 프로필 (시총, 산업, 기업개요 등)
+        try {
+            const profileRes = await fmpClient.get(`/profile/${symbol}`);
+            if (profileRes.data && profileRes.data.length > 0) {
+                const profile = profileRes.data[0];
+                const docRef = db.collection('stocks').doc(symbol).collection('info').doc('profile');
+                batch.set(docRef, profile);
+            }
+        } catch(e) { console.warn('Profile fetch fail'); }
+
+        // 2. 재무제표 (연간 기준 최근 10년치)
+        const statements = ['income-statement', 'balance-sheet-statement', 'cash-flow-statement'];
+        
+        for (const stmt of statements) {
+            try {
+                // limit=10: 최근 10년치
+                const res = await fmpClient.get(`/${stmt}/${symbol}?limit=10`);
+                if (res.data && res.data.length > 0) {
+                    const docRef = db.collection('stocks').doc(symbol).collection('financials').doc(stmt);
+                    // 배열 전체를 하나의 문서에 저장 (검색 효율성 위함)
+                    batch.set(docRef, { 
+                        type: stmt,
+                        updatedAt: new Date().toISOString(),
+                        history: res.data 
+                    });
+                }
+            } catch (e) {
+                console.warn(`${stmt} fetch fail for ${symbol}`);
+            }
+        }
+
+        await batch.commit();
+        res.json({ success: true, symbol, message: "재무 데이터 저장 완료" });
+
+    } catch (error) {
+        console.error(`[Financials Error] ${symbol}:`, error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+
+// [테스트용] API 키 생존 확인 (무료 엔드포인트)
+app.get('/api/test-alive', async (req, res) => {
+    try {
+        // 애플(AAPL)의 기본 프로필 정보는 무료입니다.
+        const response = await fmpClient.get('/profile/AAPL');
+        res.json({ 
+            status: 'ALIVE', 
+            message: 'API 키는 살아있습니다. 프리미엄 기능만 막힌 것 같습니다.',
+            data: response.data 
+        });
+    } catch (error) {
+        res.status(error.response ? error.response.status : 500).json({ 
+            status: 'DEAD', 
+            message: 'API 키 자체가 정지되었습니다.',
+            error: error.message 
+        });
+    }
+});
+
+// ======================================================================
+// FMP API -   끝
+// ======================================================================
 
 // [테스트] 1분마다 콘솔에 로그 찍기
 //cron.schedule('* * * * *', () => {
@@ -1211,7 +2821,6 @@ app.get('/api/proxy/yahoo-info', async (req, res) => {
 // ----------------------------------------------------------------
 // 마지막에 둬야 하는 것
 // ----------------------------------------------------------------
-
 // 서버 실행
 app.listen(port, () => {
     console.log(`서버 실행 중: http://localhost:${port}`);
