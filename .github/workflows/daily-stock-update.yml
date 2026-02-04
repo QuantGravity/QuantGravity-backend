@@ -2,27 +2,39 @@ name: Daily Stock Price Update
 
 on:
   schedule:
-    # 0 23 * * * = UTC 기준 밤 11시 = 한국 시간 오전 8시
+    # 0 23 * * * = UTC 23:00 = 한국 시간 오전 8시 (미국 장 마감 후)
     - cron: '0 23 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # 수동 실행 버튼
 
 jobs:
   update-stock:
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # 작업이 길어질 수 있으므로 타임아웃 넉넉히 설정
     steps:
-      - name: Send Update Request and Analyze
+      - name: Wake up Server & Update Stock Prices
         run: |
-          # 1. 주가 데이터 최신화
-          echo "Updating Stock Prices..."
-          curl -X POST "https://quant-navigator-backend.onrender.com/api/update-prices" \
-          -H "Content-Type: application/json" \
-          -d '{}'
+          echo "🚀 Starting Daily Stock Price Update..."
+          
+          # 1. 주가 데이터 최신화 (어제 날짜 하루치만 가져옴)
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST "https://quant-navigator-backend.onrender.com/api/update-prices" \
+            -H "Content-Type: application/json" \
+            -d '{}')
 
-          # 약간의 대기 (서버 부하 방지용, 선택 사항)
-          sleep 10
+          if [ "$response" -ne 200 ]; then
+            echo "❌ Failed to update prices. HTTP Status: $response"
+            exit 1
+          else
+            echo "✅ Stock Prices Update Requested Successfully."
+          fi
 
+      - name: Wait for DB Consistency
+        run: sleep 30 # DB 쓰기 작업이 안정화될 때까지 잠시 대기
+
+      - name: Analyze All Tickers
+        run: |
+          echo "🧠 Starting Batch Analysis..."
+          
           # 2. 전체 종목 분석 및 스냅샷 생성
-          echo "Analyzing All Tickers..."
           curl -X POST "https://quant-navigator-backend.onrender.com/api/batch/analyze-all-tickers" \
-          -H "Content-Type: application/json" \
-          -d '{}'
+            -H "Content-Type: application/json" \
+            -d '{}'
