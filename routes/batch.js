@@ -11,6 +11,7 @@ const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 const firestore = admin.firestore();
+const fmpClient = require('../utils/fmpClient'); // ★ [추가됨] 이게 빠져서 에러가 났었어!
 const { verifyToken } = require('../utils/authHelper');
 const { logTraffic } = require('../utils/logger');
 const { getDaysDiff } = require('../utils/math');
