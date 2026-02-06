@@ -463,41 +463,45 @@ router.post('/generate-market-map-summary', verifyToken, async (req, res) => {
 
 // ============================================================
 // [Batch] 전 종목 일일 주가 업데이트 (Bulk API 사용 - 야후 스타일)
-// [설명] : 종목별 호출(6000번) -> 날짜별 호출(5번)으로 변경. 속도 극대화.
+// [설명] : 6000번 호출하던 걸 날짜별 '1번' 호출로 끝냄. (총 5회 호출)
 // ============================================================
 router.post('/daily-update-all', async (req, res) => {
     try {
-        console.log("🚀 [Bulk Batch] 일괄 업데이트 시작 (API 호출 최소화)...");
+        console.log("🚀 [Bulk Batch] 일괄 업데이트 시작 (초고속 모드)...");
 
-        // 1. 최근 5일 날짜 생성 (주말/휴일 포함해서 넉넉히 7일치 조회해도 됨)
+        // 1. 최근 5일 날짜 생성 (오늘 포함)
+        // 미국 시장 기준 날짜로 변환하면 더 좋지만, UTC 기준으로 5일치면 충분히 커버됨
         const targetDates = [];
         for (let i = 0; i < 5; i++) {
             const d = new Date();
-            d.setDate(d.getDate() - i); // 오늘, 어제, 그제...
+            d.setDate(d.getDate() - i); 
             targetDates.push(d.toISOString().split('T')[0]);
         }
 
+        // 타임아웃 방지용 선응답
         res.status(200).json({ 
             status: 'STARTED', 
             mode: 'BULK_FAST',
-            dates: targetDates 
+            dates: targetDates,
+            message: "백그라운드에서 초고속 업데이트가 시작되었습니다." 
         });
 
-        // 비동기 처리
+        // 비동기 백그라운드 처리
         (async () => {
             let totalSaved = 0;
+            const db = admin.firestore();
 
-            // 2. 날짜별로 Bulk API 호출 (총 5번만 호출하면 됨!)
+            // 2. 날짜별로 Bulk API 호출 (총 5번만 반복)
             for (const date of targetDates) {
-                console.log(`📥 [Bulk Fetch] ${date} 데이터 요청 중...`);
+                console.log(`📥 [Bulk Fetch] ${date} 전체 종목 데이터 요청 중...`);
                 
                 try {
-                    // ★ FMP Bulk API: 특정 날짜의 전 종목 EOD 데이터 (한 방에 옴)
+                    // ★ FMP Bulk API: 해당 날짜의 모든 종목 종가 데이터 수신
                     const response = await fmpClient.get(`/batch-request-end-of-day-prices`, {
                         params: { date: date }
                     });
 
-                    const bulkData = response.data; // [{symbol: 'AAPL', close: 150...}, ...]
+                    const bulkData = response.data; 
                     if (!bulkData || bulkData.length === 0) {
                         console.log(`Pass: ${date} 데이터 없음 (휴장일 가능성)`);
                         continue;
@@ -505,28 +509,19 @@ router.post('/daily-update-all', async (req, res) => {
 
                     console.log(`✅ [Bulk Recv] ${date}: ${bulkData.length}개 종목 수신. DB 저장 시작...`);
 
-                    // 3. Firestore 저장 (Batch Write: 500개씩)
-                    // 읽기 없이 '쓰기'만 하므로 매우 빠름
-                    const db = admin.firestore();
+                    // 3. Firestore 저장 (Batch Write로 500개씩 끊어서 저장)
                     let batch = db.batch();
                     let operationCount = 0;
                     const YEAR = date.split('-')[0];
 
                     for (const item of bulkData) {
+                        // 심볼이 없거나 이상한 데이터 제외
                         if (!item.symbol) continue;
 
                         // 저장 경로: stocks/{symbol}/annual_data/{year}
-                        // 주의: 여기서 'prices' 배열에 추가하려면 arrayUnion을 써야 하는데,
-                        // 덮어쓰기(Merge) 방식으로 단순화해서 속도를 높임.
-                        
                         const docRef = db.collection('stocks').doc(item.symbol)
                                          .collection('annual_data').doc(YEAR);
 
-                        // Firestore arrayUnion은 문서 읽기 비용이 발생할 수 있음.
-                        // 대량 처리 시에는 [날짜를 Key로 하는 Map] 방식이나,
-                        // 그냥 데이터를 통째로 갱신하는 전략이 유리함.
-                        // 여기서는 가장 안전하게 'arrayUnion'을 쓰되, 500개씩 끊음.
-                        
                         const priceData = {
                             date: date,
                             open: item.open,
@@ -537,48 +532,54 @@ router.post('/daily-update-all', async (req, res) => {
                             volume: item.volume
                         };
 
-                        // [최적화] set + merge 사용 (배열 처리는 복잡하므로, 일단 개별 필드 업데이트라 가정하거나
-                        // 기존 구조 유지시 arrayUnion 사용)
+                        // (1) 연도 문서 생성 (없으면 생성, 있으면 유지)
                         batch.set(docRef, {
                             symbol: item.symbol,
                             year: YEAR,
                             lastUpdated: new Date().toISOString()
                         }, { merge: true });
 
-                        // 실제 데이터 추가 (arrayUnion은 기존 데이터 유지하며 추가)
+                        // (2) 배열에 데이터 추가 (arrayUnion: 중복 방지하며 추가)
                         batch.update(docRef, {
                             data: admin.firestore.FieldValue.arrayUnion(priceData)
                         });
 
                         operationCount++;
 
-                        // 500개 차면 커밋 (Firestore 제한)
-                        if (operationCount >= 200) { // 안전하게 200개씩
+                        // Firestore 배치 제한 (500개) 준수 - 안전하게 400개마다 커밋
+                        if (operationCount >= 400) { 
                             await batch.commit();
-                            batch = db.batch();
+                            batch = db.batch(); // 배피 초기화
                             operationCount = 0;
-                            // 0.1초 휴식 (DB 부하 방지)
-                            await new Promise(r => setTimeout(r, 100));
+                            await new Promise(r => setTimeout(r, 200)); // DB 부하 방지용 짧은 휴식
                         }
                     }
 
-                    // 남은 것 커밋
+                    // 남은 자투리 데이터 커밋
                     if (operationCount > 0) await batch.commit();
                     
                     totalSaved += bulkData.length;
-                    console.log(`💾 [Saved] ${date} 데이터 저장 완료.`);
+                    console.log(`💾 [Saved] ${date} 저장 완료.`);
 
                 } catch (err) {
                     console.error(`❌ [Error] ${date} 처리 중 실패:`, err.message);
                 }
             }
 
-            console.log(`🏁 [Bulk Batch] 모든 작업 완료. (총 처리 건수: ${totalSaved})`);
+            console.log(`🏁 [Bulk Batch] 모든 작업 완료! (총 처리 건수: ${totalSaved})`);
+            
+            // 시스템 로그에 기록
+            await db.collection('system_logs').add({
+                type: 'DAILY_BATCH_BULK',
+                status: 'COMPLETED',
+                totalProcessed: totalSaved,
+                date: new Date().toISOString()
+            });
 
         })();
 
     } catch (error) {
-        console.error("Bulk Error:", error);
+        console.error("Bulk Batch Error:", error);
         if (!res.headersSent) res.status(500).json({ error: error.message });
     }
 });
