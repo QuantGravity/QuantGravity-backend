@@ -31,88 +31,123 @@ router.get('/get-all-symbols', verifyToken, async (req, res) => {
 });
 
 // ============================================================
-// [Batch] 데일리 업데이트 (Limit 750req/min 최적화)
+// [Batch] 데일리 업데이트 (Stable Bulk API 사용)
 // ============================================================
 router.post('/daily-update-all', async (req, res) => {
     try {
-        console.log("🚀 [Opti-Batch] 일괄 업데이트 시작 (최적화 모드)...");
+        console.log("🚀 [Bulk Batch] 일괄 업데이트 시작 (Stable Bulk API)...");
 
-        // 1. 날짜 설정
+        // 1. 날짜 설정 (최근 5일)
         const targetDates = [];
         for (let i = 0; i < 5; i++) {
             const d = new Date();
             d.setDate(d.getDate() - i); 
             targetDates.push(d.toISOString().split('T')[0]);
         }
-        
-        const toDate = targetDates[0];
-        const fromDate = targetDates[targetDates.length-1];
 
-        // 2. 전체 종목 가져오기
-        const symbols = await getTickerData({ justList: true }); 
+        // 2. 전체 종목 리스트는 이제 필요 없음 (API가 다 주니까)
         
         // 타임아웃 방지용 선응답
         res.status(200).json({ 
             status: 'STARTED', 
-            mode: 'OPTIMIZED_CHUNK',
+            mode: 'STABLE_BULK_FAST',
             dates: targetDates,
-            total: symbols.length,
-            message: `전체 ${symbols.length}개 종목 업데이트가 최적화 모드(예상 15분)로 시작되었습니다.` 
+            message: "백그라운드에서 초고속 업데이트(Stable Bulk)가 시작되었습니다." 
         });
 
         // 3. 비동기 백그라운드 처리
         (async () => {
-            let successCount = 0;
-            let failCount = 0;
-            
-            // ★ [극한 튜닝] FMP Premium 한계(750req/min) 도전
-            // 12개 * 2회 = 24req. 처리시간(약1s) + 대기(1.2s) = 2.2s
-            // 분당 요청수: 24 / 2.2 * 60 = 약 654회 (안전 마지노선)
-            const CHUNK_SIZE = 12; 
-            const DELAY_MS = 1200;
+            let totalSaved = 0;
+            const db = admin.firestore();
 
-            console.log(`>> 작업 시작: ${fromDate} ~ ${toDate} (${symbols.length}개)`);
-
-            for (let i = 0; i < symbols.length; i += CHUNK_SIZE) {
-                const chunk = symbols.slice(i, i + CHUNK_SIZE);
+            for (const date of targetDates) {
+                console.log(`📥 [Bulk Fetch] ${date} 전체 종목 데이터 요청 중...`);
                 
-                // 병렬 실행
-                const promises = chunk.map(symbol => 
-                    processHybridData(symbol, fromDate, toDate, 'System_Batch')
-                        .then(() => ({ status: 'ok' }))
-                        .catch(err => ({ status: 'fail', symbol, err }))
-                );
+                try {
+                    // ★ [핵심] 문서에서 찾은 Stable Bulk API 사용
+                    // https://financialmodelingprep.com/stable/eod-bulk?date=YYYY-MM-DD
+                    const response = await fmpClient.get(`https://financialmodelingprep.com/stable/eod-bulk`, {
+                        params: { date: date }
+                    });
 
-                const results = await Promise.all(promises);
-
-                results.forEach(r => {
-                    if (r.status === 'ok') successCount++;
-                    else {
-                        failCount++;
-                        // 429 에러 발생 시 로그 강조
-                        if (r.err.message.includes('429')) console.warn(`⚠️ [Rate Limit] ${r.symbol} 속도 조절 필요`);
-                        else console.error(`❌ [${r.symbol}] 실패: ${r.err.message}`);
+                    const bulkData = response.data; 
+                    if (!bulkData || bulkData.length === 0) {
+                        console.log(`Pass: ${date} 데이터 없음 (휴장일 가능성)`);
+                        continue;
                     }
-                });
 
-                // 진행률 로깅 (100개 단위)
-                if ((i + CHUNK_SIZE) % 120 === 0) { // 10번 돌 때마다 로그
-                    const percent = Math.round(((i + CHUNK_SIZE) / symbols.length) * 100);
-                    console.log(`... 진행률: ${percent}% (${i + CHUNK_SIZE}/${symbols.length}) - 성공 ${successCount}`);
+                    console.log(`✅ [Bulk Recv] ${date}: ${bulkData.length}개 종목 수신. DB 저장 시작...`);
+
+                    let batch = db.batch();
+                    let operationCount = 0;
+                    const YEAR = date.split('-')[0];
+
+                    for (const item of bulkData) {
+                        if (!item.symbol) continue;
+
+                        // [A] 차트용 데이터 저장
+                        const historyRef = db.collection('stocks').doc(item.symbol)
+                                             .collection('annual_data').doc(YEAR);
+
+                        const priceData = {
+                            date: date,
+                            open: item.open,
+                            high: item.high,
+                            low: item.low,
+                            close: item.close,
+                            adjClose: item.adjClose || item.close,
+                            volume: item.volume
+                        };
+
+                        batch.set(historyRef, {
+                            symbol: item.symbol,
+                            year: YEAR,
+                            lastUpdated: new Date().toISOString()
+                        }, { merge: true });
+
+                        batch.update(historyRef, {
+                            data: admin.firestore.FieldValue.arrayUnion(priceData)
+                        });
+
+                        // [B] 스냅샷 업데이트
+                        const mainDocRef = db.collection('stocks').doc(item.symbol);
+                        
+                        batch.set(mainDocRef, {
+                            snapshot: {
+                                price: item.close,
+                                lastUpdated: new Date().toISOString()
+                            },
+                            active: true 
+                        }, { merge: true });
+
+                        operationCount++;
+
+                        // [C] 배치 커밋 (400개 제한)
+                        if (operationCount >= 400) { 
+                            await batch.commit();
+                            batch = db.batch(); 
+                            operationCount = 0;
+                            await new Promise(r => setTimeout(r, 200)); 
+                        }
+                    }
+
+                    if (operationCount > 0) await batch.commit();
+                    
+                    totalSaved += bulkData.length;
+                    console.log(`💾 [Saved] ${date} 저장 완료.`);
+
+                } catch (err) {
+                    console.error(`❌ [Error] ${date} 처리 중 실패:`, err.message);
+                    // 만약 여기서도 403이 뜨면... 그때는 진짜 'Ultimate' 전용임.
                 }
-
-                // ★ 속도 조절
-                await new Promise(r => setTimeout(r, DELAY_MS));
             }
 
-            console.log(`🏁 [Opti-Batch] 작업 최종 종료 (성공: ${successCount}, 실패: ${failCount})`);
+            console.log(`🏁 [Bulk Batch] 모든 작업 완료! (총 처리 건수: ${totalSaved})`);
             
             await db.collection('system_logs').add({
-                type: 'DAILY_BATCH_OPTIMIZED',
+                type: 'DAILY_BATCH_BULK_STABLE',
                 status: 'COMPLETED',
-                success: successCount,
-                fail: failCount,
-                duration_min: Math.round((new Date() - new Date()) / 60000), // 시간 계산은 실제론 start time 필요
+                success: totalSaved,
                 date: new Date().toISOString()
             });
 
