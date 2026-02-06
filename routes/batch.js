@@ -51,6 +51,7 @@ router.post('/daily-update-all', async (req, res) => {
         res.status(200).json({ 
             status: 'STARTED', 
             mode: 'THROTTLED_CHUNK',
+            dates: targetDates, // ★ [복구 완료] 이 줄이 빠져서 에러가 났던 거야!
             total: symbols.length,
             message: `전체 ${symbols.length}개 종목 업데이트가 안전 모드로 시작되었습니다.` 
         });
@@ -60,16 +61,16 @@ router.post('/daily-update-all', async (req, res) => {
             let successCount = 0;
             let failCount = 0;
             
-            // ★ [핵심 튜닝] FMP Premium(750/min) 한도 준수 설정
-            // 10개 * 2회 호출 = 20 request / 1.5초 = 분당 약 800회 (안전권 근접)
-            const CHUNK_SIZE = 10; 
+            // ★ [최종 튜닝] 429 에러 방지를 위해 더 안전하게 축소
+            // 5개 * 2회 호출 = 10 request / 1.0초 = 분당 600회 (750회 한도 대비 안전)
+            const CHUNK_SIZE = 5;  // 기존 10 -> 5로 변경
             
             console.log(`>> 작업 시작: ${fromDate} ~ ${toDate} (${symbols.length}개)`);
 
             for (let i = 0; i < symbols.length; i += CHUNK_SIZE) {
                 const chunk = symbols.slice(i, i + CHUNK_SIZE);
                 
-                // 10개를 병렬로 실행
+                // 5개를 병렬로 실행
                 const promises = chunk.map(symbol => 
                     processHybridData(symbol, fromDate, toDate, 'System_Batch')
                         .then(() => ({ status: 'ok' }))
@@ -82,18 +83,18 @@ router.post('/daily-update-all', async (req, res) => {
                     if (r.status === 'ok') successCount++;
                     else {
                         failCount++;
-                        // 429 에러가 계속 나면 로그로 확인
+                        // 에러 로그 출력
                         console.error(`❌ [${r.symbol}] 실패: ${r.err.message}`);
                     }
                 });
 
-                // 진행률 로깅 (300개 단위)
-                if ((i + CHUNK_SIZE) % 300 === 0) {
+                // 진행률 로깅 (100개 단위로 자주 찍어서 확인)
+                if ((i + CHUNK_SIZE) % 100 === 0) {
                     console.log(`... 진행률: ${Math.min(i + CHUNK_SIZE, symbols.length)}/${symbols.length} (성공 ${successCount})`);
                 }
 
-                // ★ [속도 제한] 1.2초 대기 (API 과부하 방지)
-                await new Promise(r => setTimeout(r, 1200));
+                // ★ [속도 제한] 1초 대기
+                await new Promise(r => setTimeout(r, 1000));
             }
 
             console.log(`🏁 [Safe Batch] 작업 최종 종료 (성공: ${successCount}, 실패: ${failCount})`);
