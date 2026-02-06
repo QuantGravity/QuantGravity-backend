@@ -7,15 +7,11 @@
 //   3. 재처리 보장: 작업 실패 시 해당 종목의 상태를 'ERROR'로 기록하여 추적 가능하게 한다.
 //   4. 메모리 관리: 대량 데이터 처리 시 Promise.all보다는 순차(for-of) 처리를 권장한다.
 // ===========================================================================
-// ===========================================================================
-// [파일명] : routes/batch.js
-// [설명]   : 안정성을 최우선으로 한 고속 배치 처리 (Plan 제한 우회)
-// ===========================================================================
 const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 const firestore = admin.firestore();
-const fmpClient = require('../utils/fmpClient'); // ★ 필수 모듈 포함
+const fmpClient = require('../utils/fmpClient'); 
 const { verifyToken } = require('../utils/authHelper');
 const { logTraffic } = require('../utils/logger');
 const { getDaysDiff } = require('../utils/math');
@@ -35,12 +31,11 @@ router.get('/get-all-symbols', verifyToken, async (req, res) => {
 });
 
 // ============================================================
-// [Batch] 데일리 업데이트 (안전한 병렬 처리 모드)
-// [특징] Bulk API(403에러) 대신 processHybridData를 30개씩 병렬로 수행
+// [Batch] 데일리 업데이트 (안전한 병렬 처리 모드 - Rate Limit 준수)
 // ============================================================
 router.post('/daily-update-all', async (req, res) => {
     try {
-        console.log("🚀 [Safe Batch] 일괄 업데이트 시작 (병렬 청크 모드)...");
+        console.log("🚀 [Safe Batch] 일괄 업데이트 시작 (속도 조절 모드)...");
 
         // 1. 날짜 설정 (최근 5일)
         const today = new Date();
@@ -55,26 +50,26 @@ router.post('/daily-update-all', async (req, res) => {
         // 타임아웃 방지용 선응답
         res.status(200).json({ 
             status: 'STARTED', 
-            mode: 'PARALLEL_CHUNK',
+            mode: 'THROTTLED_CHUNK',
             total: symbols.length,
-            message: `전체 ${symbols.length}개 종목 업데이트가 백그라운드에서 시작되었습니다.` 
+            message: `전체 ${symbols.length}개 종목 업데이트가 안전 모드로 시작되었습니다.` 
         });
 
-        // 3. 비동기 백그라운드 처리 (병렬 실행)
+        // 3. 비동기 백그라운드 처리
         (async () => {
             let successCount = 0;
             let failCount = 0;
             
-            // ★ 핵심: 한 번에 처리할 개수 (너무 크면 429 에러, 적당히 20~30개 추천)
-            const CHUNK_SIZE = 30; 
+            // ★ [핵심 튜닝] FMP Premium(750/min) 한도 준수 설정
+            // 10개 * 2회 호출 = 20 request / 1.5초 = 분당 약 800회 (안전권 근접)
+            const CHUNK_SIZE = 10; 
             
             console.log(`>> 작업 시작: ${fromDate} ~ ${toDate} (${symbols.length}개)`);
 
             for (let i = 0; i < symbols.length; i += CHUNK_SIZE) {
-                // 30개씩 자르기
                 const chunk = symbols.slice(i, i + CHUNK_SIZE);
                 
-                // 30개를 동시에 실행 (Promise.all)
+                // 10개를 병렬로 실행
                 const promises = chunk.map(symbol => 
                     processHybridData(symbol, fromDate, toDate, 'System_Batch')
                         .then(() => ({ status: 'ok' }))
@@ -83,27 +78,26 @@ router.post('/daily-update-all', async (req, res) => {
 
                 const results = await Promise.all(promises);
 
-                // 결과 집계
                 results.forEach(r => {
                     if (r.status === 'ok') successCount++;
                     else {
                         failCount++;
+                        // 429 에러가 계속 나면 로그로 확인
                         console.error(`❌ [${r.symbol}] 실패: ${r.err.message}`);
                     }
                 });
 
-                // 진행 상황 로그 (선택 사항)
+                // 진행률 로깅 (300개 단위)
                 if ((i + CHUNK_SIZE) % 300 === 0) {
-                    console.log(`... 진행률: ${i + CHUNK_SIZE}/${symbols.length} (성공 ${successCount})`);
+                    console.log(`... 진행률: ${Math.min(i + CHUNK_SIZE, symbols.length)}/${symbols.length} (성공 ${successCount})`);
                 }
 
-                // ★ API 과부하 방지를 위한 짧은 휴식 (0.5초)
-                await new Promise(r => setTimeout(r, 500));
+                // ★ [속도 제한] 1.2초 대기 (API 과부하 방지)
+                await new Promise(r => setTimeout(r, 1200));
             }
 
             console.log(`🏁 [Safe Batch] 작업 최종 종료 (성공: ${successCount}, 실패: ${failCount})`);
             
-            // 로그 저장
             await db.collection('system_logs').add({
                 type: 'DAILY_BATCH_PARALLEL',
                 status: 'COMPLETED',
@@ -431,148 +425,6 @@ router.post('/generate-market-map-summary', verifyToken, async (req, res) => {
     } catch (err) {
         console.error("Market Map Summary Error:", err);
         res.status(500).json({ error: err.message });
-    }
-});
-
-// ============================================================
-// [Batch] 전 종목 일일 주가 업데이트 (Bulk API 사용 - 야후 스타일)
-// [기능] 1. 차트용 과거 데이터 저장 (annual_data)
-//        2. 메인화면용 스냅샷 가격 업데이트 (stocks/{symbol}.snapshot)
-// ============================================================
-router.post('/daily-update-all', async (req, res) => {
-    try {
-        console.log("🚀 [Bulk Batch] 일괄 업데이트 시작 (초고속 모드 + 스냅샷)...");
-
-        // 1. 최근 5일 날짜 생성 (Moment 라이브러리 없이 구현)
-        const targetDates = [];
-        for (let i = 0; i < 5; i++) {
-            const d = new Date();
-            d.setDate(d.getDate() - i); 
-            // YYYY-MM-DD 형식 변환
-            const dateStr = d.toISOString().split('T')[0];
-            targetDates.push(dateStr);
-        }
-
-        // 타임아웃 방지용 선응답
-        res.status(200).json({ 
-            status: 'STARTED', 
-            mode: 'BULK_FAST_SNAPSHOT',
-            dates: targetDates,
-            message: "백그라운드에서 초고속 업데이트(스냅샷 포함)가 시작되었습니다." 
-        });
-
-        // 비동기 백그라운드 처리
-        (async () => {
-            let totalSaved = 0;
-            const db = admin.firestore();
-
-            // 2. 날짜별로 Bulk API 호출
-            for (const date of targetDates) {
-                console.log(`📥 [Bulk Fetch] ${date} 전체 종목 데이터 요청 중...`);
-                
-                try {
-                    // ★ FMP Bulk API 호출
-                    const response = await fmpClient.get(`/batch-request-end-of-day-prices`, {
-                        params: { date: date }
-                    });
-
-                    const bulkData = response.data; 
-                    if (!bulkData || bulkData.length === 0) {
-                        console.log(`Pass: ${date} 데이터 없음 (휴장일 가능성)`);
-                        continue;
-                    }
-
-                    console.log(`✅ [Bulk Recv] ${date}: ${bulkData.length}개 종목 수신. DB 저장 시작...`);
-
-                    let batch = db.batch();
-                    let operationCount = 0;
-                    const YEAR = date.split('-')[0];
-
-                    for (const item of bulkData) {
-                        if (!item.symbol) continue;
-
-                        // -------------------------------------------------------
-                        // [A] 차트용 데이터 저장 (stocks/{symbol}/annual_data/{year})
-                        // -------------------------------------------------------
-                        const historyRef = db.collection('stocks').doc(item.symbol)
-                                             .collection('annual_data').doc(YEAR);
-
-                        const priceData = {
-                            date: date,
-                            open: item.open,
-                            high: item.high,
-                            low: item.low,
-                            close: item.close,
-                            adjClose: item.adjClose || item.close,
-                            volume: item.volume
-                        };
-
-                        // 연도 문서 생성
-                        batch.set(historyRef, {
-                            symbol: item.symbol,
-                            year: YEAR,
-                            lastUpdated: new Date().toISOString()
-                        }, { merge: true });
-
-                        // 데이터 배열 추가
-                        batch.update(historyRef, {
-                            data: admin.firestore.FieldValue.arrayUnion(priceData)
-                        });
-
-                        // -------------------------------------------------------
-                        // [B] ★ 스냅샷 업데이트 (stocks/{symbol}) - 스타크 요청 반영
-                        // 메인 리스트에서 최신 가격을 보여주기 위함
-                        // -------------------------------------------------------
-                        const mainDocRef = db.collection('stocks').doc(item.symbol);
-                        
-                        // 주의: snapshot 전체를 덮어쓰면 안 되고, 가격 관련 필드만 merge해야 함
-                        batch.set(mainDocRef, {
-                            snapshot: {
-                                price: item.close,         // 현재가 업데이트
-                                lastUpdated: new Date().toISOString()
-                                // mktCap, beta 등은 Bulk API에 없으므로 기존 값 유지
-                            },
-                            active: true // 데이터가 들어왔으니 활성 상태 확정
-                        }, { merge: true });
-
-                        operationCount++;
-
-                        // -------------------------------------------------------
-                        // [C] 배치 커밋 (400개 제한)
-                        // -------------------------------------------------------
-                        if (operationCount >= 400) { 
-                            await batch.commit();
-                            batch = db.batch(); 
-                            operationCount = 0;
-                            await new Promise(r => setTimeout(r, 200)); 
-                        }
-                    }
-
-                    // 남은 데이터 커밋
-                    if (operationCount > 0) await batch.commit();
-                    
-                    totalSaved += bulkData.length;
-                    console.log(`💾 [Saved] ${date} 저장 완료 (스냅샷 포함).`);
-
-                } catch (err) {
-                    console.error(`❌ [Error] ${date} 처리 중 실패:`, err.message);
-                }
-            }
-
-            console.log(`🏁 [Bulk Batch] 모든 작업 완료! (총 처리 건수: ${totalSaved})`);
-            
-            await db.collection('system_logs').add({
-                type: 'DAILY_BATCH_BULK',
-                status: 'COMPLETED',
-                totalProcessed: totalSaved,
-                date: new Date().toISOString()
-            });
-
-        })();
-
-    } catch (error) {
-        console.error("Bulk Batch Error:", error);
-        if (!res.headersSent) res.status(500).json({ error: error.message });
     }
 });
 
