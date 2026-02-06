@@ -7,6 +7,7 @@
 //   3. 재처리 보장: 작업 실패 시 해당 종목의 상태를 'ERROR'로 기록하여 추적 가능하게 한다.
 //   4. 메모리 관리: 대량 데이터 처리 시 Promise.all보다는 순차(for-of) 처리를 권장한다.
 // ===========================================================================
+
 const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
@@ -31,28 +32,28 @@ router.get('/get-all-symbols', verifyToken, async (req, res) => {
 });
 
 // ============================================================
-// [Batch] 데일리 업데이트 (Stable Bulk API 사용)
+// [Batch] 데일리 업데이트 (STABLE Bulk API 사용 - 초고속 모드)
 // ============================================================
 router.post('/daily-update-all', async (req, res) => {
     try {
-        console.log("🚀 [Bulk Batch] 일괄 업데이트 시작 (Stable Bulk API)...");
+        console.log("🚀 [Bulk Batch] 일괄 업데이트 시작 (STABLE 버전 사용)...");
 
         // 1. 날짜 설정 (최근 5일)
         const targetDates = [];
         for (let i = 0; i < 5; i++) {
             const d = new Date();
             d.setDate(d.getDate() - i); 
+            // YYYY-MM-DD 포맷
             targetDates.push(d.toISOString().split('T')[0]);
         }
 
-        // 2. 전체 종목 리스트는 이제 필요 없음 (API가 다 주니까)
-        
-        // 타임아웃 방지용 선응답
+        // 2. 클라이언트 즉시 응답 (타임아웃 방지)
+        // ★ 중요: 프론트엔드 에러 방지를 위해 dates 필드 필수 포함
         res.status(200).json({ 
             status: 'STARTED', 
             mode: 'STABLE_BULK_FAST',
             dates: targetDates,
-            message: "백그라운드에서 초고속 업데이트(Stable Bulk)가 시작되었습니다." 
+            message: "백그라운드에서 초고속 업데이트(STABLE Bulk)가 시작되었습니다." 
         });
 
         // 3. 비동기 백그라운드 처리
@@ -61,17 +62,20 @@ router.post('/daily-update-all', async (req, res) => {
             const db = admin.firestore();
 
             for (const date of targetDates) {
-                console.log(`📥 [Bulk Fetch] ${date} 전체 종목 데이터 요청 중...`);
+                console.log(`📥 [Bulk Fetch] ${date} 데이터 요청 중 (STABLE Endpoint)...`);
                 
                 try {
-                    // ★ [핵심] 문서에서 찾은 Stable Bulk API 사용
-                    // https://financialmodelingprep.com/stable/eod-bulk?date=YYYY-MM-DD
+                    // ★ [핵심 수정] FMP STABLE 엔드포인트 사용
+                    // 문서: https://financialmodelingprep.com/stable/eod-bulk?date=YYYY-MM-DD
                     const response = await fmpClient.get(`https://financialmodelingprep.com/stable/eod-bulk`, {
-                        params: { date: date }
+                        params: { 
+                            date: date,
+                            apikey: process.env.FMP_API_KEY // 혹시 몰라 명시적 추가
+                        }
                     });
 
                     const bulkData = response.data; 
-                    if (!bulkData || bulkData.length === 0) {
+                    if (!bulkData || !Array.isArray(bulkData) || bulkData.length === 0) {
                         console.log(`Pass: ${date} 데이터 없음 (휴장일 가능성)`);
                         continue;
                     }
@@ -85,7 +89,7 @@ router.post('/daily-update-all', async (req, res) => {
                     for (const item of bulkData) {
                         if (!item.symbol) continue;
 
-                        // [A] 차트용 데이터 저장
+                        // [A] 차트용 데이터 저장 (annual_data)
                         const historyRef = db.collection('stocks').doc(item.symbol)
                                              .collection('annual_data').doc(YEAR);
 
@@ -99,22 +103,24 @@ router.post('/daily-update-all', async (req, res) => {
                             volume: item.volume
                         };
 
+                        // 1) 연도별 문서 메타 업데이트
                         batch.set(historyRef, {
                             symbol: item.symbol,
                             year: YEAR,
                             lastUpdated: new Date().toISOString()
                         }, { merge: true });
 
+                        // 2) 배열에 가격 데이터 추가 (arrayUnion)
                         batch.update(historyRef, {
                             data: admin.firestore.FieldValue.arrayUnion(priceData)
                         });
 
-                        // [B] 스냅샷 업데이트
+                        // [B] 메인 스냅샷(현재가) 업데이트
                         const mainDocRef = db.collection('stocks').doc(item.symbol);
                         
                         batch.set(mainDocRef, {
                             snapshot: {
-                                price: item.close,
+                                price: item.close, // 최신 종가 반영
                                 lastUpdated: new Date().toISOString()
                             },
                             active: true 
@@ -127,10 +133,12 @@ router.post('/daily-update-all', async (req, res) => {
                             await batch.commit();
                             batch = db.batch(); 
                             operationCount = 0;
-                            await new Promise(r => setTimeout(r, 200)); 
+                            // 과부하 방지용 미세 딜레이
+                            await new Promise(r => setTimeout(r, 100)); 
                         }
                     }
 
+                    // 남은 데이터 커밋
                     if (operationCount > 0) await batch.commit();
                     
                     totalSaved += bulkData.length;
@@ -138,7 +146,6 @@ router.post('/daily-update-all', async (req, res) => {
 
                 } catch (err) {
                     console.error(`❌ [Error] ${date} 처리 중 실패:`, err.message);
-                    // 만약 여기서도 403이 뜨면... 그때는 진짜 'Ultimate' 전용임.
                 }
             }
 
