@@ -12,7 +12,6 @@ jobs:
     steps:
       - name: Trigger Daily Batch Update
         run: |
-          # 백엔드에 새로 만든 일괄 처리 API 호출
-          curl -X POST "https://quant-navigator-backend.onrender.com/api/batch/daily-update-all" \
+          curl -X POST "https://quantgravity-backend.onrender.com/api/batch/daily-update-all" \
           -H "Content-Type: application/json" \
           -d '{}'
