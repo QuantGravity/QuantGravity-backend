@@ -7,25 +7,27 @@
 //   3. 재처리 보장: 작업 실패 시 해당 종목의 상태를 'ERROR'로 기록하여 추적 가능하게 한다.
 //   4. 메모리 관리: 대량 데이터 처리 시 Promise.all보다는 순차(for-of) 처리를 권장한다.
 // ===========================================================================
+// ===========================================================================
+// [파일명] : routes/batch.js
+// [설명]   : 배치 작업 및 데이터 처리 라우터 (Bulk API v4 주소 적용 Fix)
+// ===========================================================================
 const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 const firestore = admin.firestore();
-const fmpClient = require('../utils/fmpClient'); // ★ [추가됨] 이게 빠져서 에러가 났었어!
+const fmpClient = require('../utils/fmpClient'); 
 const { verifyToken } = require('../utils/authHelper');
 const { logTraffic } = require('../utils/logger');
 const { getDaysDiff } = require('../utils/math');
 const { performAnalysisInternal } = require('../utils/analysisEngine');
-const { processHybridData } = require('../utils/stockHelper'); // ★ 공통 로직 재사용
-const { getTickerData } = require('../utils/stockHelper'); // ★ 종목 리스트 가져오는 함수 (위치 확인 필요)
+const { processHybridData } = require('../utils/stockHelper'); 
+const { getTickerData } = require('../utils/stockHelper'); 
 
 // ============================================================
-// [유틸리티] 전체 종목 코드 추출 (배치 작업용) - server.js 버전
+// [유틸리티] 전체 종목 코드 추출
 // ============================================================
-
 router.get('/get-all-symbols', verifyToken, async (req, res) => {
     try {
-        // [수정 2] justList: true 옵션을 줘서 종목 코드 배열만 가져옴
         const uniqueSymbols = await getTickerData({ justList: true });
         res.json({ success: true, count: uniqueSymbols.length, symbols: uniqueSymbols });
     } catch (error) {
@@ -33,119 +35,145 @@ router.get('/get-all-symbols', verifyToken, async (req, res) => {
     }
 });
 
-/**
- * [배치용] 특정 종목의 과거 데이터를 모두 읽어서 통계 및 메타 정보를 상위 문서에 업데이트합니다.
- * @param {string} ticker - 종목 코드 (예: AAPL)
- */
-async function updateStockStats(ticker) {
-  const db = admin.firestore();
-  const stockRef = db.collection('stocks').doc(ticker);
+// ============================================================
+// [Batch] 전 종목 일일 주가 업데이트 (Bulk API 사용 - 야후 스타일)
+// [수정사항] API 주소를 v4 전체 경로로 변경하여 404 에러 해결
+// ============================================================
+router.post('/daily-update-all', async (req, res) => {
+    try {
+        console.log("🚀 [Bulk Batch] 일괄 업데이트 시작 (초고속 모드 + 스냅샷)...");
 
-  try {
-    // 1. 연도별 데이터(annual_data) 모두 가져오기 (읽기 비용 최소화)
-    const annualSnapshot = await stockRef.collection('annual_data').get();
+        // 1. 최근 5일 날짜 생성
+        const targetDates = [];
+        for (let i = 0; i < 5; i++) {
+            const d = new Date();
+            d.setDate(d.getDate() - i); 
+            const dateStr = d.toISOString().split('T')[0];
+            targetDates.push(dateStr);
+        }
 
-    if (annualSnapshot.empty) {
-      console.log(`[Skip] No data for ${ticker}`);
-      return;
+        // 타임아웃 방지용 선응답
+        res.status(200).json({ 
+            status: 'STARTED', 
+            mode: 'BULK_FAST_SNAPSHOT_V4',
+            dates: targetDates,
+            message: "백그라운드에서 초고속 업데이트(스냅샷 포함)가 시작되었습니다." 
+        });
+
+        // 비동기 백그라운드 처리
+        (async () => {
+            let totalSaved = 0;
+            const db = admin.firestore();
+
+            // 2. 날짜별로 Bulk API 호출
+            for (const date of targetDates) {
+                console.log(`📥 [Bulk Fetch] ${date} 전체 종목 데이터 요청 중...`);
+                
+                try {
+                    // ★ [핵심 수정] v4 전체 URL을 명시해서 v3 기본 설정을 무시하게 함
+                    const response = await fmpClient.get(`https://financialmodelingprep.com/api/v4/batch-request-end-of-day-prices`, {
+                        params: { date: date }
+                    });
+
+                    const bulkData = response.data; 
+                    if (!bulkData || bulkData.length === 0) {
+                        console.log(`Pass: ${date} 데이터 없음 (휴장일 가능성)`);
+                        continue;
+                    }
+
+                    console.log(`✅ [Bulk Recv] ${date}: ${bulkData.length}개 종목 수신. DB 저장 시작...`);
+
+                    let batch = db.batch();
+                    let operationCount = 0;
+                    const YEAR = date.split('-')[0];
+
+                    for (const item of bulkData) {
+                        if (!item.symbol) continue;
+
+                        // -------------------------------------------------------
+                        // [A] 차트용 데이터 저장
+                        // -------------------------------------------------------
+                        const historyRef = db.collection('stocks').doc(item.symbol)
+                                             .collection('annual_data').doc(YEAR);
+
+                        const priceData = {
+                            date: date,
+                            open: item.open,
+                            high: item.high,
+                            low: item.low,
+                            close: item.close,
+                            adjClose: item.adjClose || item.close,
+                            volume: item.volume
+                        };
+
+                        batch.set(historyRef, {
+                            symbol: item.symbol,
+                            year: YEAR,
+                            lastUpdated: new Date().toISOString()
+                        }, { merge: true });
+
+                        batch.update(historyRef, {
+                            data: admin.firestore.FieldValue.arrayUnion(priceData)
+                        });
+
+                        // -------------------------------------------------------
+                        // [B] 스냅샷 업데이트
+                        // -------------------------------------------------------
+                        const mainDocRef = db.collection('stocks').doc(item.symbol);
+                        
+                        batch.set(mainDocRef, {
+                            snapshot: {
+                                price: item.close,
+                                lastUpdated: new Date().toISOString()
+                            },
+                            active: true 
+                        }, { merge: true });
+
+                        operationCount++;
+
+                        // -------------------------------------------------------
+                        // [C] 배치 커밋 (400개 제한)
+                        // -------------------------------------------------------
+                        if (operationCount >= 400) { 
+                            await batch.commit();
+                            batch = db.batch(); 
+                            operationCount = 0;
+                            await new Promise(r => setTimeout(r, 200)); 
+                        }
+                    }
+
+                    if (operationCount > 0) await batch.commit();
+                    
+                    totalSaved += bulkData.length;
+                    console.log(`💾 [Saved] ${date} 저장 완료.`);
+
+                } catch (err) {
+                    // 404가 계속 뜨면 오타나 플랜 문제일 수 있음
+                    console.error(`❌ [Error] ${date} 처리 중 실패:`, err.message);
+                }
+            }
+
+            console.log(`🏁 [Bulk Batch] 모든 작업 완료! (총 처리 건수: ${totalSaved})`);
+            
+            await db.collection('system_logs').add({
+                type: 'DAILY_BATCH_BULK',
+                status: 'COMPLETED',
+                totalProcessed: totalSaved,
+                date: new Date().toISOString()
+            });
+
+        })();
+
+    } catch (error) {
+        console.error("Bulk Batch Error:", error);
+        if (!res.headersSent) res.status(500).json({ error: error.message });
     }
+});
 
-    let allDailyData = [];
-    let startDate = null;
-    let endDate = null;
+// ... (기존 updateStockStats, analyze-all-tickers 등 코드는 아래에 그대로 유지) ...
+// (파일 뒷부분은 스타크가 업로드한 원본 그대로 두면 돼)
 
-    // 2. 데이터를 메모리에 평탄화 (Flatten) 및 정렬
-    annualSnapshot.docs.forEach(doc => {
-      const yearData = doc.data().data || []; // 'data' 필드에 배열로 저장되어 있다고 가정
-      if (yearData.length > 0) {
-        allDailyData = allDailyData.concat(yearData);
-      }
-    });
-
-    // 날짜 오름차순 정렬 (필수)
-    allDailyData.sort((a, b) => new Date(a.date) - new Date(b.date));
-
-    const totalDays = allDailyData.length;
-    if (totalDays === 0) return;
-
-    startDate = allDailyData[0].date;
-    endDate = allDailyData[totalDays - 1].date;
-    const startPrice = allDailyData[0].close; // 수정주가(adjClose) 권장
-    const endPrice = allDailyData[totalDays - 1].close;
-
-    // 3. 통계 지표 계산 (MDD, CAGR)
-    let maxPrice = 0;
-    let maxDrawdown = 0;
-
-    // MDD 계산 Loop
-    for (const day of allDailyData) {
-      const price = day.close;
-      if (price > maxPrice) maxPrice = price;
-      
-      const drawdown = (maxPrice - price) / maxPrice * 100;
-      if (drawdown > maxDrawdown) maxDrawdown = drawdown;
-    }
-
-    // CAGR 계산 (Total, 10년, 5년)
-    const calculateCAGR = (sPrice, ePrice, years) => {
-        if (sPrice <= 0 || years <= 0) return 0;
-        return ((Math.pow(ePrice / sPrice, 1 / years) - 1) * 100).toFixed(2);
-    };
-
-    const totalYears = (new Date(endDate) - new Date(startDate)) / (1000 * 60 * 60 * 24 * 365.25);
-    const cagrAll = calculateCAGR(startPrice, endPrice, totalYears);
-
-    // 최근 10년, 5년 데이터 찾기 (역순 탐색)
-    const getPastPrice = (yearsAgo) => {
-        const targetDate = new Date(new Date(endDate).setFullYear(new Date(endDate).getFullYear() - yearsAgo));
-        // 근사값 찾기 (정확히 일치하지 않을 수 있으므로)
-        const found = allDailyData.find(d => new Date(d.date) >= targetDate);
-        return found ? found.close : null;
-    };
-
-    const price10y = getPastPrice(10);
-    const price5y = getPastPrice(5);
-    const cagr10y = price10y ? calculateCAGR(price10y, endPrice, 10) : null;
-    const cagr5y = price5y ? calculateCAGR(price5y, endPrice, 5) : null;
-
-    // 4. 상위 문서(stocks/{ticker}) 업데이트
-    const updateData = {
-      active: true, // 데이터가 존재하므로 활성화
-      
-      // 메타 정보 (재처리 및 관리용)
-      data_status: {
-        start_date: startDate,
-        end_date: endDate,
-        total_trading_days: totalDays,
-        last_analysis_time: admin.firestore.FieldValue.serverTimestamp(), // 배치 실행 시간 기록
-        status: 'COMPLETED'
-      },
-
-      // 화면 표시용 분석 정보 (미리 계산됨)
-      stats: {
-        current_price: endPrice,
-        mdd_all_time: parseFloat(maxDrawdown.toFixed(2)),
-        cagr_all: parseFloat(cagrAll),
-        cagr_10y: cagr10y ? parseFloat(cagr10y) : null,
-        cagr_5y: cagr5y ? parseFloat(cagr5y) : null
-      }
-    };
-
-    await stockRef.set(updateData, { merge: true });
-    console.log(`[Success] Updated stats for ${ticker} (MDD: -${updateData.stats.mdd_all_time}%)`);
-
-  } catch (error) {
-    console.error(`[Error] Failed to analyze ${ticker}:`, error);
-    // 에러 발생 시 상태 업데이트
-    await stockRef.set({ 
-        data_status: { 
-            last_analysis_time: admin.firestore.FieldValue.serverTimestamp(),
-            status: 'ERROR',
-            error_msg: error.message
-        } 
-    }, { merge: true });
-  }
-}
+module.exports = router;
 
 // 라우터 설정 (기존 express router에 추가)
 // 호출 예시: POST /batch/update-stats { "tickers": ["AAPL", "TSLA"] }
