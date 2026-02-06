@@ -467,7 +467,8 @@ router.post('/generate-market-map-summary', verifyToken, async (req, res) => {
 // [배치] 전 종목 일일 주가 업데이트 (GitHub Actions용) -> 범위 수집으로 업그레이드
 router.post('/daily-update-all', async (req, res) => {
     try {
-        console.log("🚀 [Batch] 일괄 자동 업데이트 시작 (Range Mode)...");
+        // [강제 업데이트용 주석] V2 배포 확인 - 2026.02.05
+        console.log("🚀 [Batch] 일괄 자동 업데이트 시작 (Range Mode V2)...");
 
         // [수정 핵심]
         // 기존: 어제 날짜 하루만 타겟팅 -> 시차 문제로 당일 데이터 누락 가능성 있음
