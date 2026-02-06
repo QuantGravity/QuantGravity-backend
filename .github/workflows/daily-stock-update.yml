@@ -11,8 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger Daily Batch Update
-      run: |
-        # 주소를 quantgravity-backend 로 수정!
-        curl -X POST "https://quantgravity-backend.onrender.com/api/batch/daily-update-all" \
-        -H "Content-Type: application/json" \
-        -d '{}'
+        run: |
+          curl -X POST "https://quantgravity-backend.onrender.com/api/batch/daily-update-all" \
+          -H "Content-Type: application/json" \
+          -d '{}'
