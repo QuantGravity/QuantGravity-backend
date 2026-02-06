@@ -11,6 +11,7 @@ const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 const firestore = admin.firestore();
+const moment = require('moment'); // 날짜 계산용 (없으면 설치하거나 Date 객체 사용)
 const { verifyToken } = require('../utils/authHelper');
 const { logTraffic } = require('../utils/logger');
 const { getDaysDiff } = require('../utils/math');
@@ -460,68 +461,124 @@ router.post('/generate-market-map-summary', verifyToken, async (req, res) => {
     }
 });
 
-// [배치] 전 종목 일일 주가 업데이트 (GitHub Actions용)
-// [파일 위치]: routes/batch.js
-// 기존 daily-update-all 라우트를 이 코드로 대체
-
-// [배치] 전 종목 일일 주가 업데이트 (GitHub Actions용) -> 범위 수집으로 업그레이드
+// ============================================================
+// [Batch] 전 종목 일일 주가 업데이트 (Bulk API 사용 - 야후 스타일)
+// [설명] : 종목별 호출(6000번) -> 날짜별 호출(5번)으로 변경. 속도 극대화.
+// ============================================================
 router.post('/daily-update-all', async (req, res) => {
     try {
-        // [강제 업데이트용 주석] V2 배포 확인 - 2026.02.05
-        console.log("🚀 [Batch] 일괄 자동 업데이트 시작 (Range Mode V3)...");
+        console.log("🚀 [Bulk Batch] 일괄 업데이트 시작 (API 호출 최소화)...");
 
-        // [수정 핵심]
-        // 기존: 어제 날짜 하루만 타겟팅 -> 시차 문제로 당일 데이터 누락 가능성 있음
-        // 변경: 오늘 포함 '최근 5일' 데이터를 요청. 
-        // 효과: 시차 문제 해결 + 배치가 며칠 실패해도 다음 배치가 돌면 자동 복구됨 (Self-Healing)
-        
-        const today = new Date();
-        const toDate = today.toISOString().split('T')[0]; // UTC 기준 오늘 (이미 장 마감 후이므로 오늘 날짜 사용)
+        // 1. 최근 5일 날짜 생성 (주말/휴일 포함해서 넉넉히 7일치 조회해도 됨)
+        const targetDates = [];
+        for (let i = 0; i < 5; i++) {
+            const d = new Date();
+            d.setDate(d.getDate() - i); // 오늘, 어제, 그제...
+            targetDates.push(d.toISOString().split('T')[0]);
+        }
 
-        const pastDate = new Date();
-        pastDate.setDate(pastDate.getDate() - 5); // 안전하게 5일 전부터 조회
-        const fromDate = pastDate.toISOString().split('T')[0];
-
-        // 2. 전체 종목 리스트 가져오기
-        const symbols = await getTickerData({ justList: true }); 
-        
-        // 타임아웃 방지용 선응답 (GitHub Action이 기다리지 않게)
         res.status(200).json({ 
-            message: `Started batch update for ${symbols.length} tickers.`, 
-            range: `${fromDate} ~ ${toDate}`,
-            timestamp: new Date().toISOString()
+            status: 'STARTED', 
+            mode: 'BULK_FAST',
+            dates: targetDates 
         });
 
-        // 3. 비동기 백그라운드 처리
+        // 비동기 처리
         (async () => {
-            let successCount = 0;
-            let failCount = 0;
+            let totalSaved = 0;
 
-            console.log(`>> Target Range: ${fromDate} ~ ${toDate}`);
-
-            for (const symbol of symbols) {
-                try {
-                    // ★ processHybridData는 이미 (symbol, from, to) 인자를 받도록 설계되어 있음
-                    // 기존: await processHybridData(symbol, targetDate, targetDate, 'BatchBot');
-                    // 변경: 범위를 전달
-                    await processHybridData(symbol, fromDate, toDate, 'BatchBot');
-                    
-                    // 로그가 너무 많으면 지저분하니 10개 단위나 에러일 때만 찍어도 됨 (일단은 유지)
-                    // console.log(`✅ [Batch] ${symbol} 완료`);
-                    successCount++;
-                } catch (err) {
-                    console.error(`❌ [Batch] ${symbol} 실패: ${err.message}`);
-                    failCount++;
-                }
+            // 2. 날짜별로 Bulk API 호출 (총 5번만 호출하면 됨!)
+            for (const date of targetDates) {
+                console.log(`📥 [Bulk Fetch] ${date} 데이터 요청 중...`);
                 
-                // FMP API Rate Limit 보호를 위한 딜레이 (조금 더 여유있게 300ms 추천)
-                await new Promise(r => setTimeout(r, 300));
+                try {
+                    // ★ FMP Bulk API: 특정 날짜의 전 종목 EOD 데이터 (한 방에 옴)
+                    const response = await fmpClient.get(`/batch-request-end-of-day-prices`, {
+                        params: { date: date }
+                    });
+
+                    const bulkData = response.data; // [{symbol: 'AAPL', close: 150...}, ...]
+                    if (!bulkData || bulkData.length === 0) {
+                        console.log(`Pass: ${date} 데이터 없음 (휴장일 가능성)`);
+                        continue;
+                    }
+
+                    console.log(`✅ [Bulk Recv] ${date}: ${bulkData.length}개 종목 수신. DB 저장 시작...`);
+
+                    // 3. Firestore 저장 (Batch Write: 500개씩)
+                    // 읽기 없이 '쓰기'만 하므로 매우 빠름
+                    const db = admin.firestore();
+                    let batch = db.batch();
+                    let operationCount = 0;
+                    const YEAR = date.split('-')[0];
+
+                    for (const item of bulkData) {
+                        if (!item.symbol) continue;
+
+                        // 저장 경로: stocks/{symbol}/annual_data/{year}
+                        // 주의: 여기서 'prices' 배열에 추가하려면 arrayUnion을 써야 하는데,
+                        // 덮어쓰기(Merge) 방식으로 단순화해서 속도를 높임.
+                        
+                        const docRef = db.collection('stocks').doc(item.symbol)
+                                         .collection('annual_data').doc(YEAR);
+
+                        // Firestore arrayUnion은 문서 읽기 비용이 발생할 수 있음.
+                        // 대량 처리 시에는 [날짜를 Key로 하는 Map] 방식이나,
+                        // 그냥 데이터를 통째로 갱신하는 전략이 유리함.
+                        // 여기서는 가장 안전하게 'arrayUnion'을 쓰되, 500개씩 끊음.
+                        
+                        const priceData = {
+                            date: date,
+                            open: item.open,
+                            high: item.high,
+                            low: item.low,
+                            close: item.close,
+                            adjClose: item.adjClose || item.close,
+                            volume: item.volume
+                        };
+
+                        // [최적화] set + merge 사용 (배열 처리는 복잡하므로, 일단 개별 필드 업데이트라 가정하거나
+                        // 기존 구조 유지시 arrayUnion 사용)
+                        batch.set(docRef, {
+                            symbol: item.symbol,
+                            year: YEAR,
+                            lastUpdated: new Date().toISOString()
+                        }, { merge: true });
+
+                        // 실제 데이터 추가 (arrayUnion은 기존 데이터 유지하며 추가)
+                        batch.update(docRef, {
+                            data: admin.firestore.FieldValue.arrayUnion(priceData)
+                        });
+
+                        operationCount++;
+
+                        // 500개 차면 커밋 (Firestore 제한)
+                        if (operationCount >= 200) { // 안전하게 200개씩
+                            await batch.commit();
+                            batch = db.batch();
+                            operationCount = 0;
+                            // 0.1초 휴식 (DB 부하 방지)
+                            await new Promise(r => setTimeout(r, 100));
+                        }
+                    }
+
+                    // 남은 것 커밋
+                    if (operationCount > 0) await batch.commit();
+                    
+                    totalSaved += bulkData.length;
+                    console.log(`💾 [Saved] ${date} 데이터 저장 완료.`);
+
+                } catch (err) {
+                    console.error(`❌ [Error] ${date} 처리 중 실패:`, err.message);
+                }
             }
-            console.log(`🏁 [Batch] 작업 종료 (성공: ${successCount}, 실패: ${failCount})`);
+
+            console.log(`🏁 [Bulk Batch] 모든 작업 완료. (총 처리 건수: ${totalSaved})`);
+
         })();
 
     } catch (error) {
-        console.error("Batch Error:", error);
+        console.error("Bulk Error:", error);
         if (!res.headersSent) res.status(500).json({ error: error.message });
     }
 });
