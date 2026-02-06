@@ -132,27 +132,27 @@ async function processHybridData(arg1, arg2, arg3, arg4) {
 
             if (profile) {
                 const updateData = {
-                    // 1. 고정 정보
-                    symbol: profile.symbol,
-                    name_en: profile.companyName,
-                    exchange: profile.exchangeShortName || profile.exchange,
-                    sector: profile.sector,
-                    industry: profile.industry,
-                    ipoDate: profile.ipoDate,
-                    description: profile.description,
-                    website: profile.website,
-                    currency: profile.currency,
-                    image: profile.image,
-                    ceo: profile.ceo,
+                    // 1. 고정 정보 (undefined 방지 처리)
+                    symbol: profile.symbol || '',
+                    name_en: profile.companyName || '',
+                    exchange: profile.exchangeShortName || profile.exchange || '',
+                    sector: profile.sector || '',   // 값이 없으면 빈 문자열로 대체
+                    industry: profile.industry || '',
+                    ipoDate: profile.ipoDate || '',
+                    description: profile.description || '',
+                    website: profile.website || '',
+                    currency: profile.currency || 'USD',
+                    image: profile.image || '',
+                    ceo: profile.ceo || '',
 
                     // 2. 변동 정보 (스냅샷)
                     snapshot: {
-                        price: profile.price,
-                        mktCap: profile.mktCap,
-                        vol: profile.volAvg,
-                        beta: profile.beta,
-                        div: profile.lastDiv,
-                        range: profile.range,
+                        price: profile.price || 0,
+                        mktCap: profile.mktCap || 0,
+                        vol: profile.volAvg || 0,
+                        beta: profile.beta || 0,
+                        div: profile.lastDiv || 0,
+                        range: profile.range || '',
                         lastUpdated: new Date().toISOString()
                     },
 
