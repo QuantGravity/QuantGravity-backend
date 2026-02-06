@@ -7,7 +7,6 @@
 //   3. 재처리 보장: 작업 실패 시 해당 종목의 상태를 'ERROR'로 기록하여 추적 가능하게 한다.
 //   4. 메모리 관리: 대량 데이터 처리 시 Promise.all보다는 순차(for-of) 처리를 권장한다.
 // ===========================================================================
-
 const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
@@ -32,129 +31,98 @@ router.get('/get-all-symbols', verifyToken, async (req, res) => {
 });
 
 // ============================================================
-// [Batch] 데일리 업데이트 (STABLE Bulk API 사용 - 초고속 모드)
+// [Batch] 데일리 업데이트 (안전한 병렬 처리 모드)
 // ============================================================
 router.post('/daily-update-all', async (req, res) => {
     try {
-        console.log("🚀 [Bulk Batch] 일괄 업데이트 시작 (STABLE 버전 사용)...");
+        console.log("🚀 [Safe Batch] 일괄 업데이트 시작 (속도 조절 모드)...");
 
-        // 1. 날짜 설정 (최근 5일)
+        // 1. 날짜 설정 (최근 5일) - 프론트엔드 응답용 변수 선언
         const targetDates = [];
         for (let i = 0; i < 5; i++) {
             const d = new Date();
             d.setDate(d.getDate() - i); 
-            // YYYY-MM-DD 포맷
             targetDates.push(d.toISOString().split('T')[0]);
         }
+        
+        // 데이터 조회용 기간 설정 (5일치를 한 번에 요청)
+        const toDate = targetDates[0]; // 오늘
+        const fromDate = targetDates[targetDates.length - 1]; // 5일 전
 
-        // 2. 클라이언트 즉시 응답 (타임아웃 방지)
-        // ★ 중요: 프론트엔드 에러 방지를 위해 dates 필드 필수 포함
+        // 2. 전체 종목 가져오기
+        const symbols = await getTickerData({ justList: true }); 
+        
+        // 3. 클라이언트 즉시 응답 (타임아웃 방지)
+        // dates 필드를 꼭 넣어서 프론트엔드 에러 방지
         res.status(200).json({ 
             status: 'STARTED', 
-            mode: 'STABLE_BULK_FAST',
+            mode: 'SAFE_PARALLEL_BATCH',
             dates: targetDates,
-            message: "백그라운드에서 초고속 업데이트(STABLE Bulk)가 시작되었습니다." 
+            total: symbols.length,
+            message: `전체 ${symbols.length}개 종목 업데이트가 안전 모드(약 20분 소요)로 시작되었습니다.` 
         });
 
-        // 3. 비동기 백그라운드 처리
+        // 4. 비동기 백그라운드 처리 (서버 혼자 열심히 일함)
         (async () => {
-            let totalSaved = 0;
-            const db = admin.firestore();
+            let successCount = 0;
+            let failCount = 0;
+            
+            // ★ [최적 속도 튜닝] 
+            // FMP Premium 한도: 분당 750회
+            // 설정: 8개 * 2회 요청 = 16회 / 1.2초 = 분당 약 800회 (이론상 최대치 근접)
+            // 만약 429 에러가 뜨면 CHUNK_SIZE를 5로 줄여야 함.
+            const CHUNK_SIZE = 8; 
+            const DELAY_MS = 1200; // 1.2초 대기
+            
+            console.log(`>> 작업 시작: ${fromDate} ~ ${toDate} (총 ${symbols.length}개)`);
 
-            for (const date of targetDates) {
-                console.log(`📥 [Bulk Fetch] ${date} 데이터 요청 중 (STABLE Endpoint)...`);
+            for (let i = 0; i < symbols.length; i += CHUNK_SIZE) {
+                // 청크 자르기
+                const chunk = symbols.slice(i, i + CHUNK_SIZE);
                 
-                try {
-                    // ★ [핵심 수정] FMP STABLE 엔드포인트 사용
-                    // 문서: https://financialmodelingprep.com/stable/eod-bulk?date=YYYY-MM-DD
-                    const response = await fmpClient.get(`https://financialmodelingprep.com/stable/eod-bulk`, {
-                        params: { 
-                            date: date,
-                            apikey: process.env.FMP_API_KEY // 혹시 몰라 명시적 추가
-                        }
-                    });
+                // 병렬 실행 (Promise.all)
+                const promises = chunk.map(symbol => 
+                    // processHybridData 내부에서 from~to 기간의 데이터를 가져와서 저장함
+                    processHybridData(symbol, fromDate, toDate, 'System_Batch')
+                        .then(() => ({ status: 'ok' }))
+                        .catch(err => ({ status: 'fail', symbol, err }))
+                );
 
-                    const bulkData = response.data; 
-                    if (!bulkData || !Array.isArray(bulkData) || bulkData.length === 0) {
-                        console.log(`Pass: ${date} 데이터 없음 (휴장일 가능성)`);
-                        continue;
-                    }
+                const results = await Promise.all(promises);
 
-                    console.log(`✅ [Bulk Recv] ${date}: ${bulkData.length}개 종목 수신. DB 저장 시작...`);
-
-                    let batch = db.batch();
-                    let operationCount = 0;
-                    const YEAR = date.split('-')[0];
-
-                    for (const item of bulkData) {
-                        if (!item.symbol) continue;
-
-                        // [A] 차트용 데이터 저장 (annual_data)
-                        const historyRef = db.collection('stocks').doc(item.symbol)
-                                             .collection('annual_data').doc(YEAR);
-
-                        const priceData = {
-                            date: date,
-                            open: item.open,
-                            high: item.high,
-                            low: item.low,
-                            close: item.close,
-                            adjClose: item.adjClose || item.close,
-                            volume: item.volume
-                        };
-
-                        // 1) 연도별 문서 메타 업데이트
-                        batch.set(historyRef, {
-                            symbol: item.symbol,
-                            year: YEAR,
-                            lastUpdated: new Date().toISOString()
-                        }, { merge: true });
-
-                        // 2) 배열에 가격 데이터 추가 (arrayUnion)
-                        batch.update(historyRef, {
-                            data: admin.firestore.FieldValue.arrayUnion(priceData)
-                        });
-
-                        // [B] 메인 스냅샷(현재가) 업데이트
-                        const mainDocRef = db.collection('stocks').doc(item.symbol);
-                        
-                        batch.set(mainDocRef, {
-                            snapshot: {
-                                price: item.close, // 최신 종가 반영
-                                lastUpdated: new Date().toISOString()
-                            },
-                            active: true 
-                        }, { merge: true });
-
-                        operationCount++;
-
-                        // [C] 배치 커밋 (400개 제한)
-                        if (operationCount >= 400) { 
-                            await batch.commit();
-                            batch = db.batch(); 
-                            operationCount = 0;
-                            // 과부하 방지용 미세 딜레이
-                            await new Promise(r => setTimeout(r, 100)); 
+                // 결과 집계
+                results.forEach(r => {
+                    if (r.status === 'ok') successCount++;
+                    else {
+                        failCount++;
+                        // 429(Too Many Requests) 에러는 경고로 표시
+                        if (r.err.message && r.err.message.includes('429')) {
+                            console.warn(`⚠️ [Rate Limit] ${r.symbol} 잠시 대기 필요`);
+                        } else {
+                            console.error(`❌ [${r.symbol}] 실패: ${r.err.message}`);
                         }
                     }
+                });
 
-                    // 남은 데이터 커밋
-                    if (operationCount > 0) await batch.commit();
-                    
-                    totalSaved += bulkData.length;
-                    console.log(`💾 [Saved] ${date} 저장 완료.`);
-
-                } catch (err) {
-                    console.error(`❌ [Error] ${date} 처리 중 실패:`, err.message);
+                // 진행률 로깅 (100개 단위)
+                if ((i + CHUNK_SIZE) % 100 === 0) {
+                    const progress = Math.min(i + CHUNK_SIZE, symbols.length);
+                    const percent = ((progress / symbols.length) * 100).toFixed(1);
+                    console.log(`... 진행률: ${percent}% (${progress}/${symbols.length}) - 성공 ${successCount}`);
                 }
+
+                // ★ 속도 제한 (API 과부하 방지 필수)
+                await new Promise(r => setTimeout(r, DELAY_MS));
             }
 
-            console.log(`🏁 [Bulk Batch] 모든 작업 완료! (총 처리 건수: ${totalSaved})`);
+            console.log(`🏁 [Safe Batch] 작업 최종 종료 (성공: ${successCount}, 실패: ${failCount})`);
             
+            // 시스템 로그 저장
             await db.collection('system_logs').add({
-                type: 'DAILY_BATCH_BULK_STABLE',
+                type: 'DAILY_BATCH_PARALLEL',
                 status: 'COMPLETED',
-                success: totalSaved,
+                success: successCount,
+                fail: failCount,
                 date: new Date().toISOString()
             });
 
