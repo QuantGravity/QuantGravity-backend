@@ -162,7 +162,7 @@ async function processHybridData(arg1, arg2, arg3, arg4) {
                 };
 
                 await admin.firestore().collection('stocks').doc(symbol).set(updateData, { merge: true });
-                console.log(`✅ [${symbol}] 프로필 및 스냅샷 업데이트 완료`);
+                console.log(`✅ [${symbol}] 프로필 및 스냅샷 업데이트 완료 V2`);
             } else {
                 console.log(`⚠️ [${symbol}] 프로필 데이터 없음 (주가 수집만 진행)`);
             }
