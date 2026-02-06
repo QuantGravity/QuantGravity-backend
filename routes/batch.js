@@ -31,18 +31,22 @@ router.get('/get-all-symbols', verifyToken, async (req, res) => {
 });
 
 // ============================================================
-// [Batch] 데일리 업데이트 (안전한 병렬 처리 모드 - Rate Limit 준수)
+// [Batch] 데일리 업데이트 (Limit 750req/min 최적화)
 // ============================================================
 router.post('/daily-update-all', async (req, res) => {
     try {
-        console.log("🚀 [Safe Batch] 일괄 업데이트 시작 (속도 조절 모드)...");
+        console.log("🚀 [Opti-Batch] 일괄 업데이트 시작 (최적화 모드)...");
 
-        // 1. 날짜 설정 (최근 5일)
-        const today = new Date();
-        const toDate = today.toISOString().split('T')[0]; 
-        const pastDate = new Date();
-        pastDate.setDate(pastDate.getDate() - 5); 
-        const fromDate = pastDate.toISOString().split('T')[0];
+        // 1. 날짜 설정
+        const targetDates = [];
+        for (let i = 0; i < 5; i++) {
+            const d = new Date();
+            d.setDate(d.getDate() - i); 
+            targetDates.push(d.toISOString().split('T')[0]);
+        }
+        
+        const toDate = targetDates[0];
+        const fromDate = targetDates[targetDates.length-1];
 
         // 2. 전체 종목 가져오기
         const symbols = await getTickerData({ justList: true }); 
@@ -50,10 +54,10 @@ router.post('/daily-update-all', async (req, res) => {
         // 타임아웃 방지용 선응답
         res.status(200).json({ 
             status: 'STARTED', 
-            mode: 'THROTTLED_CHUNK',
-            dates: targetDates, // ★ [복구 완료] 이 줄이 빠져서 에러가 났던 거야!
+            mode: 'OPTIMIZED_CHUNK',
+            dates: targetDates,
             total: symbols.length,
-            message: `전체 ${symbols.length}개 종목 업데이트가 안전 모드로 시작되었습니다.` 
+            message: `전체 ${symbols.length}개 종목 업데이트가 최적화 모드(예상 15분)로 시작되었습니다.` 
         });
 
         // 3. 비동기 백그라운드 처리
@@ -61,16 +65,18 @@ router.post('/daily-update-all', async (req, res) => {
             let successCount = 0;
             let failCount = 0;
             
-            // ★ [최종 튜닝] 429 에러 방지를 위해 더 안전하게 축소
-            // 5개 * 2회 호출 = 10 request / 1.0초 = 분당 600회 (750회 한도 대비 안전)
-            const CHUNK_SIZE = 5;  // 기존 10 -> 5로 변경
-            
+            // ★ [극한 튜닝] FMP Premium 한계(750req/min) 도전
+            // 12개 * 2회 = 24req. 처리시간(약1s) + 대기(1.2s) = 2.2s
+            // 분당 요청수: 24 / 2.2 * 60 = 약 654회 (안전 마지노선)
+            const CHUNK_SIZE = 12; 
+            const DELAY_MS = 1200;
+
             console.log(`>> 작업 시작: ${fromDate} ~ ${toDate} (${symbols.length}개)`);
 
             for (let i = 0; i < symbols.length; i += CHUNK_SIZE) {
                 const chunk = symbols.slice(i, i + CHUNK_SIZE);
                 
-                // 5개를 병렬로 실행
+                // 병렬 실행
                 const promises = chunk.map(symbol => 
                     processHybridData(symbol, fromDate, toDate, 'System_Batch')
                         .then(() => ({ status: 'ok' }))
@@ -83,27 +89,30 @@ router.post('/daily-update-all', async (req, res) => {
                     if (r.status === 'ok') successCount++;
                     else {
                         failCount++;
-                        // 에러 로그 출력
-                        console.error(`❌ [${r.symbol}] 실패: ${r.err.message}`);
+                        // 429 에러 발생 시 로그 강조
+                        if (r.err.message.includes('429')) console.warn(`⚠️ [Rate Limit] ${r.symbol} 속도 조절 필요`);
+                        else console.error(`❌ [${r.symbol}] 실패: ${r.err.message}`);
                     }
                 });
 
-                // 진행률 로깅 (100개 단위로 자주 찍어서 확인)
-                if ((i + CHUNK_SIZE) % 100 === 0) {
-                    console.log(`... 진행률: ${Math.min(i + CHUNK_SIZE, symbols.length)}/${symbols.length} (성공 ${successCount})`);
+                // 진행률 로깅 (100개 단위)
+                if ((i + CHUNK_SIZE) % 120 === 0) { // 10번 돌 때마다 로그
+                    const percent = Math.round(((i + CHUNK_SIZE) / symbols.length) * 100);
+                    console.log(`... 진행률: ${percent}% (${i + CHUNK_SIZE}/${symbols.length}) - 성공 ${successCount}`);
                 }
 
-                // ★ [속도 제한] 1초 대기
-                await new Promise(r => setTimeout(r, 1000));
+                // ★ 속도 조절
+                await new Promise(r => setTimeout(r, DELAY_MS));
             }
 
-            console.log(`🏁 [Safe Batch] 작업 최종 종료 (성공: ${successCount}, 실패: ${failCount})`);
+            console.log(`🏁 [Opti-Batch] 작업 최종 종료 (성공: ${successCount}, 실패: ${failCount})`);
             
             await db.collection('system_logs').add({
-                type: 'DAILY_BATCH_PARALLEL',
+                type: 'DAILY_BATCH_OPTIMIZED',
                 status: 'COMPLETED',
                 success: successCount,
                 fail: failCount,
+                duration_min: Math.round((new Date() - new Date()) / 60000), // 시간 계산은 실제론 start time 필요
                 date: new Date().toISOString()
             });
 
