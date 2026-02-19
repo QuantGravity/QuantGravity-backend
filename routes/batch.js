@@ -17,7 +17,7 @@ const { performAnalysisInternal } = require('../utils/analysisEngine');
 const { getDaysDiff } = require('../utils/math');
 
 // ⚡ [추가] 배치 & 관리자 공용 인증 미들웨어 (fmp.js와 동일)
-const BATCH_SECRET = process.env.BATCH_SECRET_KEY || 'quantgravity_batch_secret'; 
+const BATCH_SECRET = process.env.BATCH_SECRET_KEY || 'quantgravity_batch_secret_20260218'; 
 const verifyBatchOrAdmin = (req, res, next) => {
     const batchKey = req.headers['x-batch-key'];
     if (batchKey && batchKey === BATCH_SECRET) {

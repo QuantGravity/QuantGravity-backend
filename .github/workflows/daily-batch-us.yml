@@ -21,7 +21,7 @@ jobs:
           -H "Content-Type: application/json" \
           -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}"
 
-      # 2. 미국 주가 업데이트 (US 파라미터 전달)
+      # 2. 미국 주가 업데이트 (US 파라미터 전달)   
       # [확인] 여기는 아주 잘 작성했어!
       - name: US Stock Price Update
         timeout-minutes: 15
@@ -33,7 +33,7 @@ jobs:
           -d '{"days": 3, "market": "US"}' 
 
       # 3. 통계 갱신
-      # [수정] 여기도 x-batch-key 헤더 필수 추가!
+      # [수정] 여기도 x-batch-key 헤더 필수 추가!  
       - name: Update Market Stats
         run: |
           curl -X POST https://quantgravity-backend.onrender.com/api/batch/update-stats \

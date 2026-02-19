@@ -23,7 +23,7 @@ jobs:
           -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}" \
           -d '{"days": 3, "market": "KR"}'
 
-      # 2. 마켓맵/통계 갱신 (한국장 반영)
+      # 2. 마켓맵/통계 갱신 (한국장 반영)   
       - name: Update Market Stats
         run: |
           curl -X POST https://quantgravity-backend.onrender.com/api/batch/update-stats \
