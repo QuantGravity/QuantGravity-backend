@@ -7,107 +7,202 @@
 //   3. 안전한 쓰기: 파일 생성 전 디렉토리 존재 여부를 확인하고 필요 시 자동으로 생성(recursive)한다.
 //   4. 무결성 보장: 수정 요청 시 기존 소스 코드 전체를 자비스에게 전달하여 로직 유실을 방지한다.
 // ===========================================================================
+
 const express = require('express');
 const router = express.Router();
 const path = require('path');
 const fs = require('fs');
-const { askJarvis } = require('../utils/jarvisClient'); // 유틸리티 연결
-const admin = require('firebase-admin'); // [추가] DB 사용을 위해 필요
-const db = admin.firestore();            // [추가] Firestore 인스턴스
+const { askJarvis } = require('../utils/jarvisClient'); 
+const admin = require('firebase-admin'); 
+const db = admin.firestore();            
+const { verifyToken } = require('../utils/authHelper');
+const axios = require('axios');
 
 // ---------------------------------------------------------------------------
-// [Util] AI 응답에서 JSON만 깔끔하게 추출하는 함수
+// [Util] AI 응답에서 JSON만 깔끔하게 추출하는 함수 (만능 버전)
 // ---------------------------------------------------------------------------
 function cleanAndParseJSON(text) {
     try {
-        // 마크다운 코드 블록 제거 (```json ... ```)
-        let cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
-        // 혹시 모를 앞뒤 잡동사니 제거 ( [ 로 시작해서 ] 로 끝나는 부분만 추출)
-        const firstBracket = cleanText.indexOf('[');
-        const lastBracket = cleanText.lastIndexOf(']');
-        if (firstBracket !== -1 && lastBracket !== -1) {
-            cleanText = cleanText.substring(firstBracket, lastBracket + 1);
+        // 1. 마크다운 코드 블록 제거 (```json ... ```)
+        // gi 플래그를 써서 대소문자 구분 없이 제거
+        let cleanText = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+        
+        // 2. JSON의 시작( { 또는 [ )과 끝( } 또는 ] )을 찾아서 추출
+        const firstCurly = cleanText.indexOf('{');
+        const firstSquare = cleanText.indexOf('[');
+        
+        let start = -1;
+        // 둘 중 먼저 나오는 것을 시작점으로 잡음
+        if (firstCurly !== -1 && firstSquare !== -1) {
+            start = Math.min(firstCurly, firstSquare);
+        } else if (firstCurly !== -1) {
+            start = firstCurly;
+        } else if (firstSquare !== -1) {
+            start = firstSquare;
         }
+
+        const lastCurly = cleanText.lastIndexOf('}');
+        const lastSquare = cleanText.lastIndexOf(']');
+        
+        // 둘 중 나중에 나오는 것을 끝점으로 잡음
+        let end = Math.max(lastCurly, lastSquare);
+
+        if (start !== -1 && end !== -1) {
+            cleanText = cleanText.substring(start, end + 1);
+        }
+
         return JSON.parse(cleanText);
     } catch (e) {
-        console.error("JSON 파싱 실패:", text);
+        console.error("JSON 파싱 실패 Raw:", text);
         throw new Error("AI 응답을 JSON으로 변환하는데 실패했습니다.");
     }
 }
 
-// ---------------------------------------------------------------------------
-// [API 1] 신규 테마 리서치 (중복 방지 + 종목 15개 수집)
-// 요청 URL: /api/admin/research-new-themes
-// ---------------------------------------------------------------------------
 // ===========================================================================
-// [API 1] 신규 테마 리서치 (종목 선정 사유 포함 업그레이드)
-// 요청 URL: /api/jarvis/research-new-themes
+// [API] ETF 속성 일괄 분석 (로컬 키워드 매칭 + AI 정밀 분석 통합)
 // ===========================================================================
-router.post('/research-new-themes', async (req, res) => {
-    console.log("🤖 [자비스] 신규 테마 리서치 시작 (선정 사유 포함)...");
-    req.setTimeout(90000); // 90초 타임아웃
+router.post('/analyze-etf-bulk', verifyToken, async (req, res) => {
+    const { items } = req.body; 
+    if (!items || !Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: "분석할 데이터(items)가 필요합니다." });
+    }
+
+    console.log(`🤖 [자비스] ETF 지능형 복합 분석 시작: ${items.length}건`);
+
+    // 1. [로컬 로직] 지수 판별 키워드 및 매칭 맵핑
+    const indexMapping = [
+        { kw: ['S&P 500', 'SNP 500', 'SP500'], ticker: '^SPX' },
+        { kw: ['NASDAQ 100', '나스닥 100', 'NDX100'], ticker: '^NDX' },
+        { kw: ['KOSPI 200', '코스피 200', 'K200'], ticker: '^KS200' }, // 키워드 추가
+        { kw: ['KOSDAQ 150', '코스닥 150'], ticker: '^KQ150' },
+        { kw: ['DOW JONES', '다우존스'], ticker: '^DJI' },
+        { kw: ['SOX', '필라델피아 반도체'], ticker: '^SOX' },
+        { kw: ['NVDA', '엔비디아'], ticker: 'NVDA' },
+        { kw: ['TSLA', '테슬라'], ticker: 'TSLA' }
+    ];
+
+    // 2. AI에게 전달하기 전, 로컬에서 먼저 기초자산 추측
+    const enrichedItems = items.map(item => {
+        const nameUpper = (item.ticker_name_kr || item.description || "").toUpperCase();
+        let guessedTicker = "";
+
+        for (const mapping of indexMapping) {
+            if (mapping.kw.some(k => nameUpper.includes(k.toUpperCase()))) {
+                guessedTicker = mapping.ticker;
+                break;
+            }
+        }
+
+        return {
+            ...item,
+            guessed_underlying: guessedTicker // AI에게 참고용으로 전달
+        };
+    });
 
     try {
-        // [Step 1] 기존 테마 목록 로딩 (중복 방지)
+        // 3. AI 프롬프트 구성 (로컬에서 찾은 guessed_underlying 활용)
+        const prompt = `
+            Analyze the following ETF list. We provided 'guessed_underlying' based on keywords.
+            Your job is to verify it and complete the missing data.
+
+            List: ${JSON.stringify(enrichedItems)}
+
+            [Extraction Rules]
+            1. **underlying_ticker (CRITICAL)**: 
+               - If 'guessed_underlying' is provided and correct, USE IT.
+               - Otherwise, find the correct Yahoo Finance style ticker.
+               - Gold('GC=F'), Silver('SI=F'), Bitcoin('BTC-USD'), Treasury('TLT', 'IEF').
+            2. **leverage_factor**: 
+               - Inverse/Short/Bear: Negative (-1, -2, -3)
+               - Bull/Long/2x/3x: Positive (1, 2, 3)
+            3. **ticker_name_kr**: Format as "[Asset] [Leverage] [Direction]" (e.g., "나스닥 100 3배 레버리지")
+            4. **asset_class**: [Equity, Commodity, Crypto, Fixed_Income, Volatility]
+
+            [Return Format]
+            - Return ONLY a JSON Object: { "TICKER": { "underlying_ticker": "...", "leverage_factor": 1, ... } }
+        `;
+
+        const responseText = await askJarvis(prompt);
+        // AI 결과를 aiResults 변수에 저장
+        const aiResults = cleanAndParseJSON(responseText);
+
+        // [추가] 내부 표준화를 위한 티커 변환 맵핑
+        const tickerNormalizationMap = {
+            "^KOSPI200": "^KS200",
+            "^KOSPI": "^KS11",
+            "^KOSDAQ": "^KQ11",
+            // 향후 다른 혼동하기 쉬운 티커들도 여기에 추가 가능
+        };
+
+        // 4. [검증 로직] 순수하게 데이터만 정제 (정의되지 않은 aiData 대신 aiResults 사용)
+        const sanitizedResults = {};
+        Object.keys(aiResults).forEach(ticker => {
+            const info = aiResults[ticker];
+            // 1. AI 응답 티커 추출 및 대문자 변환
+            let rawUnderlying = (info.underlying_ticker || "SPY").toUpperCase();
+            
+            // 2. [핵심] 표준화 맵핑 적용 (없으면 그대로 유지)
+            const normalizedUnderlying = tickerNormalizationMap[rawUnderlying] || rawUnderlying;
+
+            sanitizedResults[ticker] = {
+                underlying_ticker: normalizedUnderlying,
+                leverage_factor: parseFloat(info.leverage_factor) || 1,
+                ticker_name_kr: info.ticker_name_kr || `${ticker} ETF`,
+                asset_class: info.asset_class || "Equity",
+                updated_at: new Date().toISOString()
+            };
+        });
+
+        console.log(`✅ [자비스] 지능형 분석 완료 (${Object.keys(sanitizedResults).length}건)`);
+        
+        // 정제된 데이터를 프론트엔드로 전송
+        res.json({ success: true, data: sanitizedResults });
+
+    } catch (e) {
+        console.error("ETF Intelligent Analysis Error:", e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ===========================================================================
+// [API] 신규 테마 리서치
+// ===========================================================================
+router.post('/research-new-themes', async (req, res) => {
+    console.log("🤖 [자비스] 신규 테마 리서치 시작...");
+    req.setTimeout(90000); 
+
+    try {
         const snapshot = await db.collection('market_themes').get();
         let existingThemes = "None";
         if (!snapshot.empty) {
             existingThemes = snapshot.docs.map(doc => doc.data().name_en).join(', ');
         }
 
-        // [Step 2] AI 요청 (프롬프트 강화)
         const prompt = `
             너는 월스트리트의 수석 퀀트 분석가야.
-            현재 미국 주식 시장을 주도하고 있는 '투자 테마(Investment Themes)' 10가지를 발굴해줘.
-
-            [중복 방지]
-            이미 보유 중인 다음 테마들은 제외해: ${existingThemes}
-
-            [핵심 요구사항]
-            1. 각 테마별로 **상위 15개 주도주(Key Stocks)**를 포함할 것.
-            2. 종목별로 **'선정 사유(reason)'를 한글 15~30자 내외로 간결하게** 작성할 것. (핵심만 요약)
-            3. 관련성 점수(relevance_score)를 100점 만점으로 평가할 것.
-
-            [JSON 포맷 예시]
-            [
-                {
-                    "id": "ai_robotics",
-                    "name_en": "AI Robotics",
-                    "name_ko": "AI 로봇 공학",
-                    "description": "휴머노이드 및 산업 자동화 로봇 기술",
-                    "relevance_score": 95,
-                    "tickers": [
-                        { 
-                            "symbol": "TSLA", 
-                            "name": "Tesla", 
-                            "relevance_score": 98, 
-                            "reason": "옵티머스 로봇 개발 및 AI 자율주행 선두" 
-                        },
-                        ...
-                    ]
-                }
-            ]
+            현재 미국 주식 시장을 주도하고 있는 '투자 테마' 10가지를 발굴해줘.
+            [제외 테마]: ${existingThemes}
+            
+            각 테마별로 상위 15개 주도주와 선정 사유(reason)를 한글로 포함해줘.
+            JSON 포맷 예시:
+            [ { "id": "ai", "name_en": "AI", "name_ko": "인공지능", "tickers": [...] } ]
         `;
 
         const responseText = await askJarvis(prompt);
         const themes = cleanAndParseJSON(responseText);
 
-        // [Step 3] Firestore 저장
         const batch = db.batch();
         themes.forEach(theme => {
             const docRef = db.collection('market_themes').doc(theme.id);
-            const tickerList = theme.tickers || [];
-            
             batch.set(docRef, {
                 ...theme,
-                tickers: tickerList,
-                ticker_count: tickerList.length,
+                ticker_count: theme.tickers ? theme.tickers.length : 0,
                 updated_at: new Date().toISOString()
             }, { merge: true });
         });
 
         await batch.commit();
-        console.log(`✅ [자비스] ${themes.length}개 테마 (사유 포함) 저장 완료`);
+        console.log(`✅ [자비스] ${themes.length}개 테마 저장 완료`);
         res.json({ success: true, count: themes.length });
 
     } catch (error) {
@@ -117,32 +212,16 @@ router.post('/research-new-themes', async (req, res) => {
 });
 
 // ===========================================================================
-// [API 2] 기존 테마 업데이트 (선정 사유 포함 업그레이드)
-// 요청 URL: /api/jarvis/update-theme-tickers
+// [API] 기존 테마 업데이트
 // ===========================================================================
 router.post('/update-theme-tickers', async (req, res) => {
     const { themeId } = req.body;
-    console.log(`🤖 [자비스] 테마 종목 업데이트: ${themeId}`);
-
     try {
         const themeDoc = await db.collection('market_themes').doc(themeId).get();
         if (!themeDoc.exists) throw new Error("존재하지 않는 테마입니다.");
         
         const themeName = themeDoc.data().name_en;
-
-        const prompt = `
-            투자 테마 '${themeName}'의 **상위 15개 핵심 종목**을 다시 분석해줘.
-            
-            [요구사항]
-            1. 각 종목의 **'선정 사유(reason)'를 한글 20자 내외로** 작성해줘. (예: "해당 분야 시장 점유율 1위")
-            2. 대형주와 핵심 중소형주를 포함하고, 관련성 점수(100점 만점)를 매겨줘.
-            3. JSON 배열 포맷 준수.
-
-            [JSON 예시]
-            [
-                { "symbol": "NVDA", "name": "NVIDIA", "relevance_score": 99, "reason": "AI GPU 시장 독점적 지위" }
-            ]
-        `;
+        const prompt = `투자 테마 '${themeName}'의 상위 15개 핵심 종목과 선정 사유(reason)를 JSON으로 분석해줘.`;
 
         const responseText = await askJarvis(prompt);
         const tickers = cleanAndParseJSON(responseText);
@@ -153,155 +232,85 @@ router.post('/update-theme-tickers', async (req, res) => {
             updated_at: new Date().toISOString()
         });
 
-        console.log(`✅ [자비스] ${themeName} 종목 업데이트 완료`);
         res.json({ success: true, count: tickers.length });
-
     } catch (error) {
-        console.error(error);
         res.status(500).json({ error: error.message });
     }
 });
 
 // ===========================================================================
-// [API 4] 테마 지수(Index) 산출 (DB 데이터 전용 - 디버깅 강화판)
+// [API] 테마 지수 산출 (DB Only)
 // ===========================================================================
 router.post('/calculate-theme-index', async (req, res) => {
     const { themeId } = req.body;
-    
-    // DB 작업만 하므로 타임아웃은 적당히 설정
     req.setTimeout(60000); 
 
-    console.log(`📊 [자비스] 테마 지수 산출 시작 (DB Only): ${themeId}`);
-
     try {
-        // 1. 테마 정보 가져오기
         const themeDoc = await db.collection('market_themes').doc(themeId).get();
         if (!themeDoc.exists) throw new Error("테마를 찾을 수 없습니다.");
         
-        const themeData = themeDoc.data();
-        const tickers = themeData.tickers || [];
-        
+        const tickers = themeDoc.data().tickers || [];
         if (tickers.length === 0) throw new Error("구성 종목이 없습니다.");
 
-        console.log(`.. 대상 종목: ${tickers.length}개`);
+        console.log(`📊 [자비스] 지수 산출 시작 (${tickers.length}종목)`);
 
-        // 2. 종목별 데이터 로딩 (병렬 처리)
         const stockDataPromises = tickers.map(async (t) => {
-            const symbol = t.symbol;
-            const stockRef = db.collection('stocks').doc(symbol);
-            const stockSnap = await stockRef.get();
-
-            // [진단 1] 종목 문서(상위)가 아예 없는 경우
-            if (!stockSnap.exists) {
-                console.warn(`❌ [${symbol}] 종목 마스터 문서(stocks/${symbol})가 없음 -> 스킵`);
-                return null;
-            }
+            const stockSnap = await db.collection('stocks').doc(t.symbol).get();
+            if (!stockSnap.exists) return null;
 
             const profile = stockSnap.data();
+            const price = profile.snapshot?.price;
+            const mktCap = profile.snapshot?.mktCap;
             
-            // [진단 2] 시가총액(snapshot.mktCap) 정보 확인
-            // 지수 산출 공식: (과거 주가 * 발행주식수)
-            // 발행주식수 = 현재 시가총액 / 현재 주가
-            let sharesOutstanding = 0;
+            if (!price || !mktCap) return null;
+            const shares = mktCap / price;
 
-            if (profile.snapshot && profile.snapshot.mktCap && profile.snapshot.price) {
-                sharesOutstanding = profile.snapshot.mktCap / profile.snapshot.price;
-            } else {
-                console.warn(`⚠️ [${symbol}] 프로필/시총 데이터 부족 (snapshot.mktCap 없음) -> 스킵`);
-                // 팁: 만약 프로필 데이터가 없어도 강제로 차트를 그리고 싶다면,
-                // 아래 줄 주석을 풀고 임시로 주식수를 1로 설정하세요. (단, 단순 평균 방식이 됨)
-                // sharesOutstanding = 1; 
-                return null; 
-            }
-
-            // [진단 3] 과거 주가 데이터 가져오기
-            const targetYears = ['2023', '2024', '2025', '2026'];
-            let historyMap = {}; 
-            let hasData = false;
-
-            for (const year of targetYears) {
-                const yearDoc = await stockRef.collection('annual_data').doc(year).get();
+            let historyMap = {};
+            for (const year of ['2023', '2024', '2025', '2026']) {
+                const yearDoc = await stockSnap.ref.collection('annual_data').doc(year).get();
                 if (yearDoc.exists) {
-                    const dailyList = yearDoc.data().data || [];
-                    if (dailyList.length > 0) hasData = true;
-                    
-                    dailyList.forEach(day => {
-                        // 수정주가 우선, 없으면 종가 사용
-                        const price = day.adjClose || day.close;
-                        if(price) historyMap[day.date] = price;
+                    yearDoc.data().data.forEach(d => {
+                        if(d.close) historyMap[d.date] = d.close;
                     });
                 }
             }
+            if (Object.keys(historyMap).length === 0) return null;
 
-            if (!hasData) {
-                console.warn(`⚠️ [${symbol}] 연도별 주가 데이터(annual_data)가 없음 -> 스킵`);
-                return null;
-            }
-
-            return { symbol, shares: sharesOutstanding, history: historyMap };
+            return { symbol: t.symbol, shares, history: historyMap };
         });
 
         const stocks = (await Promise.all(stockDataPromises)).filter(s => s !== null);
+        
+        if (stocks.length === 0) return res.json({ success: false, message: "유효 데이터 없음" });
 
-        // 유효한 종목이 하나도 없으면 중단
-        if (stocks.length === 0) {
-            console.error("🔥 유효한 데이터가 있는 종목이 0개입니다. (프로필 또는 주가 데이터 확인 필요)");
-            return res.json({ success: false, message: "지수 산출 실패: 유효한 종목 데이터가 없습니다." });
-        }
-
-        console.log(`✅ 데이터 로딩 성공: ${stocks.length}/${tickers.length}개 종목 합산 시작`);
-
-        // 3. 지수 합산 (Aggregation)
-        const dailyThemeStats = {}; 
-
-        stocks.forEach(stock => {
-            Object.keys(stock.history).forEach(date => {
-                const price = stock.history[date];
-                const marketCap = price * stock.shares; // 시가총액 환산
-
-                if (!dailyThemeStats[date]) dailyThemeStats[date] = 0;
-                dailyThemeStats[date] += marketCap;
+        const dailyStats = {};
+        stocks.forEach(s => {
+            Object.keys(s.history).forEach(date => {
+                if (!dailyStats[date]) dailyStats[date] = 0;
+                dailyStats[date] += s.history[date] * s.shares;
             });
         });
 
-        // 4. 저장 (연도별 분할)
+        const batch = db.batch();
+        const dates = Object.keys(dailyStats).sort();
         const statsByYear = {};
-        const dates = Object.keys(dailyThemeStats).sort();
-        
-        dates.forEach(date => {
-            const year = date.split('-')[0];
-            const marketCapSum = dailyThemeStats[date];
 
-            if (!statsByYear[year]) statsByYear[year] = {};
-            statsByYear[year][date] = { mc: Math.round(marketCapSum) }; 
+        dates.forEach(d => {
+            const y = d.split('-')[0];
+            if (!statsByYear[y]) statsByYear[y] = {};
+            statsByYear[y][d] = { mc: Math.round(dailyStats[d]) };
         });
 
-        const batch = db.batch();
-        const statsRef = db.collection('market_themes_stats');
-
-        for (const year of Object.keys(statsByYear)) {
-            const docId = `${themeId}_${year}`;
-            batch.set(statsRef.doc(docId), {
-                themeId: themeId,
-                year: year,
-                updatedAt: new Date().toISOString(),
-                daily_data: statsByYear[year]
+        for (const y of Object.keys(statsByYear)) {
+            batch.set(db.collection('market_themes_stats').doc(`${themeId}_${y}`), {
+                themeId, year: y, daily_data: statsByYear[y], updatedAt: new Date().toISOString()
             }, { merge: true });
         }
 
         await batch.commit();
-
-        console.log(`🎉 [완료] 총 ${dates.length}일치 지수 데이터 저장됨.`);
-        
-        res.json({ 
-            success: true, 
-            days_calculated: dates.length,
-            valid_tickers: stocks.length,
-            message: `지수 생성 완료 (데이터: ${dates.length}일, 종목: ${stocks.length}개)`
-        });
+        res.json({ success: true, days: dates.length });
 
     } catch (error) {
-        console.error("지수 산출 오류:", error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -310,7 +319,7 @@ router.post('/calculate-theme-index', async (req, res) => {
 router.post('/build-file', async (req, res) => {
     try {
         const { requirement, filePath } = req.body;
-        const absolutePath = path.resolve(__dirname, '../../', filePath); // 경로 계산 주의
+        const absolutePath = path.resolve(__dirname, '../../', filePath);
         
         console.log(`🤖 [자비스 빌더] 요청: ${filePath}`);
 
@@ -320,7 +329,6 @@ router.post('/build-file', async (req, res) => {
         if (fs.existsSync(absolutePath)) {
             existingCode = fs.readFileSync(absolutePath, 'utf8');
             mode = "MODIFICATION";
-            console.log(`📖 기존 파일 수정 모드 (${existingCode.length} bytes)`);
         }
 
         const myCodingStyle = `
@@ -339,13 +347,9 @@ router.post('/build-file', async (req, res) => {
             ? `${systemInstruction}\n[기존 소스]\n${existingCode}\n[수정 요청]\n${requirement}`
             : `${systemInstruction}\n[새 파일 생성 요청]\n${requirement}`;
         
-        // 유틸리티 함수 호출
         let generatedCode = await askJarvis(fullPrompt);
-
-        // 마크다운 제거 로직
         generatedCode = generatedCode.replace(/^```\w*\n?/, '').replace(/```$/, '').trim();
 
-        // 디렉토리 자동 생성 및 저장
         const dir = path.dirname(absolutePath);
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(absolutePath, generatedCode, 'utf8');
@@ -358,20 +362,13 @@ router.post('/build-file', async (req, res) => {
 });
 
 // [추가됨] 사용 가능한 모델 리스트 확인용 진단 API
-// 브라우저에서 http://localhost:3000/api/jarvis/check-models 로 접속해서 확인
 router.get('/check-models', async (req, res) => {
     try {
         const API_KEY = process.env.GEMINI_API_KEY;
-        // 모델 목록을 가져오는 API 호출
         const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}`;
         const response = await axios.get(url);
-        
-        // 보기 편하게 이름만 추출해서 보여줌
         const modelNames = response.data.models.map(m => m.name);
-        res.json({ 
-            message: "현재 사용 가능한 모델 리스트입니다.", 
-            available_models: modelNames 
-        });
+        res.json({ available_models: modelNames });
     } catch (error) {
         res.status(500).json({ error: error.response?.data || error.message });
     }

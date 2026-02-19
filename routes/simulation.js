@@ -13,12 +13,13 @@ const admin = require('firebase-admin');
 const firestore = admin.firestore();
 const { verifyToken } = require('../utils/authHelper');
 const { logTraffic } = require('../utils/logger');
-// [추가] 외부에서 가져올 함수들
-const { getDailyStockData } = require('./stock'); // 혹은 utils/stockService.js
+const { getDailyStockData } = require('../utils/stockHelper');
+const { analyzeTickerPerformance } = require('../utils/analysisEngine');
+const { simulateStrategyPerformance } = require('../utils/analysisEngine');
 
-// ============================================================
+// =============================================================
 // [API] 대량 종목 병렬 성능 분석 (Mass Parallel Ticker Analysis)
-// ============================================================
+// =============================================================
 router.post('/mass-parallel-analyze-tickers', verifyToken, async (req, res) => {
     const { tickers, startDate, endDate, rollingPeriod1, rollingPeriod2 } = req.body;
     const rp1 = parseInt(rollingPeriod1) || 10;

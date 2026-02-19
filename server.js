@@ -60,6 +60,7 @@ const stockRoutes = require('./routes/stock');
 const jarvisRoutes = require('./routes/jarvis');
 const billingRoutes = require('./routes/billing');
 const fmpRoutes = require('./routes/fmp'); // fmp 추가
+const koreaDataRouter = require('./routes/korea_data'); // 1. 파일 불러오기
 
 app.use('/api/auth', authRoutes);
 app.use('/api/firestore', firestoreRoutes);
@@ -69,6 +70,7 @@ app.use('/api/stock', stockRoutes);
 app.use('/api/jarvis', jarvisRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api/fmp', fmpRoutes); // 경로 통일
+app.use('/api/korea', koreaDataRouter);
 
 require('dotenv').config();
 

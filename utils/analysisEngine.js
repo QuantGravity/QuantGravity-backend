@@ -3,10 +3,12 @@
 // [대상]   : 종목별 성과 분석(MDD, CAGR, Rolling 등) 핵심 엔진
 // ===========================================================================
 const admin = require('firebase-admin');
+const { getDailyStockData } = require('./stockHelper'); // 👈 이 줄 추가!
+const { calculateCAGR, getMedian } = require('./math');
 
-// ============================================================
+// =============================================================
 // [리팩토링] 분석 핵심 로직을 내부 함수로 분리 (재사용 목적)
-// ============================================================
+// =============================================================
 async function analyzeTickerPerformance(ticker, startDate, endDate, rp1, rp2) {
     let prices = [];
     try {
@@ -92,48 +94,54 @@ async function analyzeTickerPerformance(ticker, startDate, endDate, rp1, rp2) {
     const maxRecovery = recoveryDays.length ? Math.max(...recoveryDays) : 0;
     const avgRecovery = recoveryDays.length ? (recoveryDays.reduce((a, b) => a + b, 0) / recoveryDays.length) : 0;
 
-// --- Rolling CAGR --- (수정됨)
+    // --- Rolling CAGR (미래 지향적 + 미달 기간 연환산 처리) ---
     const rollingArr1 = [];
     const rollingArr2 = [];
-    let idx1 = 0, idx2 = 0;
 
     for (let i = 0; i < prices.length; i++) {
         const curr = prices[i];
         
-        // [중요] 화면에서 입력받은 변수(rp1, rp2)를 사용하여 기준 날짜 계산
-        const d1 = new Date(curr.date); d1.setFullYear(curr.date.getFullYear() - rp1);
-        const d2 = new Date(curr.date); d2.setFullYear(curr.date.getFullYear() - rp2);
+        // 목표 날짜 (rp1년 후, rp2년 후)
+        const d1 = new Date(curr.date); d1.setFullYear(curr.date.getFullYear() + rp1);
+        const d2 = new Date(curr.date); d2.setFullYear(curr.date.getFullYear() + rp2);
+        
         const t1 = d1.getTime();
         const t2 = d2.getTime();
+        const lastPriceItem = prices[prices.length - 1]; // 가장 최신 데이터
 
-        // 날짜 인덱스 조정
-        while (idx1 < i && prices[idx1].date.getTime() < t1) idx1++;
-        while (idx2 < i && prices[idx2].date.getTime() < t2) idx2++;
-
-        // [오류 수정] val1, val2 변수를 여기서 미리 선언 (초기값 null)
         let val1 = null; 
         let val2 = null;
 
-        // 1. Rolling Period 1 계산 (입력받은 rp1 사용)
-        const p1 = prices[idx1];
-        if (p1 && p1.date.getTime() >= t1 && (p1.date.getTime() - t1) < 86400000 * (rp1 + 1)) { 
-            // 데이터 공백이 너무 크지 않은 경우만 계산 (rp1 + 1년 여유)
-            val1 = calculateCAGR(p1.price, curr.price, rp1);
-            rollingArr1.push(val1);
+        // 1. Rolling Period 1 (rp1년 기준)
+        const p1 = prices.find(p => p.date.getTime() >= t1 && (p.date.getTime() - t1) < 86400000 * 15);
+        if (p1) {
+            // 정기 기간(rp1년)을 다 채운 경우
+            val1 = calculateCAGR(curr.price, p1.price, rp1);
+        } else if (lastPriceItem.date > curr.date) {
+            // 기간 미달 시: 현재~최근일까지의 실제 경과 년수(years)를 계산하여 연환산
+            const years = (lastPriceItem.date - curr.date) / (1000 * 3600 * 24 * 365.25);
+            if (years >= 0.1) { // 최소 0.1년(약 36일) 이상 데이터가 있을 때만 계산
+                val1 = calculateCAGR(curr.price, lastPriceItem.price, years);
+            }
         }
+        if (val1 !== null) rollingArr1.push(val1);
 
-        // 2. Rolling Period 2 계산 (입력받은 rp2 사용)
-        const p2 = prices[idx2];
-        if (p2 && p2.date.getTime() >= t2 && (p2.date.getTime() - t2) < 86400000 * (rp2 + 1)) {
-            val2 = calculateCAGR(p2.price, curr.price, rp2);
-            rollingArr2.push(val2);
+        // 2. Rolling Period 2 (rp2년 기준)
+        const p2 = prices.find(p => p.date.getTime() >= t2 && (p.date.getTime() - t2) < 86400000 * 15);
+        if (p2) {
+            val2 = calculateCAGR(curr.price, p2.price, rp2);
+        } else if (lastPriceItem.date > curr.date) {
+            const years = (lastPriceItem.date - curr.date) / (1000 * 3600 * 24 * 365.25);
+            if (years >= 0.1) {
+                val2 = calculateCAGR(curr.price, lastPriceItem.price, years);
+            }
         }
+        if (val2 !== null) rollingArr2.push(val2);
 
-        // [데이터 병합] 위에서 계산한 val1, val2를 history 배열에 주입
-        // (history 배열은 위쪽 prices.forEach에서 이미 생성됨)
+        // history 배열에 데이터 주입
         if (history[i]) {
-            history[i].r1 = val1; // Rolling 1 (화면 입력값 1)
-            history[i].r2 = val2; // Rolling 2 (화면 입력값 2)
+            history[i].r1 = val1;
+            history[i].r2 = val2;
         }
     }
 
@@ -386,6 +394,7 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
         let dailySellAmt = 0; // 세금/수수료 차감 후 매도 금액 합계
         let dailyProfit = 0;  // 수익
         let dailyTax = 0;     // 세금
+        let dailyFee = 0;     // [수정] 일간 수수료 합계 변수 추가
 
         // [신규] 이탈 횟수
         let dailyBuyMiss = 0;
@@ -441,7 +450,9 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
                 if (executed) {
                     // 설정된 분할 횟수 이내인 경우만 실제 체결
                     if (idx < p_splitBuy) {
-                        let reqAmount = execPrice * unitQtyBuy * feeMultiplier;
+                        let pureBuyAmt = execPrice * unitQtyBuy;
+                        let currentBuyFee = pureBuyAmt * fRate; // [수정] 수수료 분리 계산
+                        let reqAmount = pureBuyAmt + currentBuyFee; // 기존 execPrice * unitQtyBuy * feeMultiplier 와 동일
                         
                         if (tempCash >= reqAmount) {
                             tempCash -= reqAmount;
@@ -449,6 +460,7 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
                             dailyBuyCount++;
                             dailyBuyQty += unitQtyBuy;
                             dailyBuyAmt += reqAmount;
+                            dailyFee += currentBuyFee; // [수정] 수수료 누적
                         } else {
                             dailyFailCount++;
                         }
@@ -511,15 +523,20 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
                             }
                             tempShares -= currentSellQty;
 
+                            let pureSellAmt = currentSellQty * execPrice;
+                            let currentSellFee = pureSellAmt * fRate; // [수정] 수수료 분리 계산
+
                             let profit = currentSellQty * (execPrice - currentAvgPrice);
-                            let tax = profit > 0 ? profit * tRate : 0;
-                            let sellAmount = (currentSellQty * execPrice) * (1 - fRate) - tax;
+                            // [수정] 이익/손실 무관하게 세율 적용 (손실 시 마이너스 세금 산출)
+                            let tax = profit * tRate; 
+                            let sellAmount = pureSellAmt - currentSellFee - tax; // [수정] 수식 명확화 (마이너스 세금은 더해지는 효과)
 
                             dailySellCount++;
                             dailySellQty += currentSellQty;
                             dailySellAmt += sellAmount;
                             dailyProfit += profit;
                             dailyTax += tax;
+                            dailyFee += currentSellFee; // [수정] 수수료 누적
                         }
                     } else {
                         // 설정 범위를 초과하여 상승한 경우
@@ -567,8 +584,9 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
             currentRecoveryDays = recoveryDays;
         }
 
-        const mdd = highAsset > 0 ? ((asset - highAsset) / highAsset * 100) : 0;
-        if (mdd < mddRate) mddRate = mdd;
+        // [회복기간 계산] 바로 아래쪽
+        const dd = highAsset > 0 ? ((asset - highAsset) / highAsset * 100) : 0;
+        if (dd < mddRate) mddRate = dd;
 
         // 상태 업데이트
         totalFailCount += dailyFailCount;
@@ -577,7 +595,7 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
         totalSellAmt += dailySellAmt;
         totalProfit += dailyProfit;
         totalTax += dailyTax;
-        totalFee += (dailyBuyAmt + dailySellAmt) / feeMultiplier;
+        totalFee += dailyFee; // [수정] 잘못된 계산식 제거 및 dailyFee 누적
 
         last_asset = asset;
         last_curLower = curLower;
@@ -762,6 +780,100 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
         }
     }
 
+    // =================================================================
+    // [신규 추가] Rolling CAGR 및 Period CAGR 계산 로직
+    // =================================================================
+    
+    // 1. 자산 히스토리 데이터 구성 (날짜 객체 변환 및 자산값)
+    // rows 배열이 있으면 그것을 사용하고, 없으면(rType!=1) 다시 구성하지 않고 priceData와 내부 변수 활용 불가하므로
+    // 시뮬레이션 루프 내에서 간이 히스토리(simHistory)를 항상 쌓아야 정확한 계산이 가능합니다.
+    // 여기서는 rType과 무관하게 계산을 위해 rows 데이터를 활용하거나, rows가 없다면 루프내에서 tempHistory를 만들어야 합니다.
+    // 성능을 위해 rows가 생성된 경우(rType=1)는 rows를 쓰고, 아니면 계산용 배열을 만듭니다.
+    
+    // *주의: rType=2,3 일 때는 rows가 null이므로, 위쪽 루프에서 history를 별도로 관리하거나 
+    // chartArrays(dates, assets)를 활용하여 재구성해야 합니다.
+    
+    let historyForCalc = [];
+    if (rows && rows.length > 0) {
+        historyForCalc = rows.map(r => ({ date: new Date(r.date), price: r.asset }));
+    } else if (chartArrays && chartArrays.dates.length > 0) {
+        historyForCalc = chartArrays.dates.map((d, i) => ({ date: new Date(d), price: chartArrays.assets[i] }));
+    } else if (recentHistory && recentHistory.length > 0) {
+        // recentHistory만으로는 전체 기간 계산 불가 -> 이 경우 계산 스킵하거나 제약 발생
+        // 하지만 통상 시뮬레이션은 전체 데이터를 돌리므로 chartArrays 데이터를 활용하는 것이 안전합니다.
+    }
+
+    // 데이터가 충분하지 않으면 계산 불가
+    let rollingStats = { r10: { min:null, med:null, max:null }, r5: { min:null, med:null, max:null } };
+    let periodCagrs = {};
+
+    if (historyForCalc.length > 1) {
+        const rollingArr10 = []; // 10년
+        const rollingArr5 = [];  // 5년
+        const rp1 = 10;
+        const rp2 = 5;
+
+        const lastItem = historyForCalc[historyForCalc.length - 1];
+        
+        // (1) Rolling CAGR 계산
+        for (let i = 0; i < historyForCalc.length; i++) {
+            const curr = historyForCalc[i];
+            const d10 = new Date(curr.date); d10.setFullYear(curr.date.getFullYear() + rp1);
+            const d5 = new Date(curr.date); d5.setFullYear(curr.date.getFullYear() + rp2);
+            
+            const t10 = d10.getTime();
+            const t5 = d5.getTime();
+
+            // 10년 후 데이터 찾기 (약 15일 오차 허용)
+            const p10 = historyForCalc.find(p => p.date.getTime() >= t10 && (p.date.getTime() - t10) < 86400000 * 15);
+            if (p10) rollingArr10.push(calculateCAGR(curr.price, p10.price, rp1));
+
+            // 5년 후 데이터 찾기
+            const p5 = historyForCalc.find(p => p.date.getTime() >= t5 && (p.date.getTime() - t5) < 86400000 * 15);
+            if (p5) rollingArr5.push(calculateCAGR(curr.price, p5.price, rp2));
+        }
+
+        const calcStats = (arr) => ({
+            min: arr.length ? Math.min(...arr) : null,
+            max: arr.length ? Math.max(...arr) : null,
+            med: arr.length ? getMedian(arr) : null
+        });
+
+        rollingStats.r10 = calcStats(rollingArr10);
+        rollingStats.r5 = calcStats(rollingArr5);
+
+        // (2) Period CAGR 계산
+        const periods = [
+            { label: 'total', years: (lastItem.date - historyForCalc[0].date) / (1000 * 3600 * 24 * 365.25), refPrice: historyForCalc[0].price },
+            { label: '30y', years: 30 }, { label: '25y', years: 25 }, { label: '20y', years: 20 },
+            { label: '15y', years: 15 }, { label: '10y', years: 10 }, { label: '7y', years: 7 },
+            { label: '5y', years: 5 }, { label: '3y', years: 3 }, { label: '1y', years: 1 },
+            { label: '6m', years: 0.5 }, { label: '3m', years: 0.25 }, { label: '1m', years: 1/12 }
+        ];
+
+        periods.forEach(p => {
+            if (p.label === 'total') {
+                periodCagrs['total'] = calculateCAGR(p.refPrice, lastItem.price, p.years);
+            } else {
+                const targetDate = new Date(lastItem.date);
+                if (p.years < 1) {
+                    targetDate.setMonth(targetDate.getMonth() - Math.round(p.years * 12));
+                } else {
+                    targetDate.setFullYear(targetDate.getFullYear() - p.years);
+                }
+                // targetDate 이후의 첫 데이터를 찾음
+                const pastItem = historyForCalc.find(item => item.date >= targetDate);
+                
+                // 데이터가 존재하고, 날짜 오차가 너무 크지 않은 경우(15일 이내) 계산
+                if (pastItem && (pastItem.date.getTime() - targetDate.getTime()) < 86400000 * 15) {
+                    periodCagrs[p.label] = calculateCAGR(pastItem.price, lastItem.price, p.years);
+                } else {
+                    periodCagrs[p.label] = null;
+                }
+            }
+        });
+    }
+
     // 최종 요약본 생성
     // [수정] 루프 밖에서 사용할 마지막 날짜 계산
     const lastDayData = priceData[priceData.length - 1];
@@ -837,6 +949,29 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
             total_days: totalDays,
             avg_StockRatio: avgStockRatio,
             avg_dd: avgDd,
+
+            // [신규 추가 항목: Rolling & Period Stats]
+            rolling_r10_min: rollingStats.r10.min,
+            rolling_r10_med: rollingStats.r10.med,
+            rolling_r10_max: rollingStats.r10.max,
+            
+            rolling_r5_min: rollingStats.r5.min,
+            rolling_r5_med: rollingStats.r5.med,
+            rolling_r5_max: rollingStats.r5.max,
+
+            cagr_total: periodCagrs['total'],
+            cagr_30y: periodCagrs['30y'],
+            cagr_25y: periodCagrs['25y'],
+            cagr_20y: periodCagrs['20y'],
+            cagr_15y: periodCagrs['15y'],
+            cagr_10y: periodCagrs['10y'],
+            cagr_7y: periodCagrs['7y'],
+            cagr_5y: periodCagrs['5y'],
+            cagr_3y: periodCagrs['3y'],
+            cagr_1y: periodCagrs['1y'],
+            cagr_6m: periodCagrs['6m'],
+            cagr_3m: periodCagrs['3m'],
+            cagr_1m: periodCagrs['1m'],
             
             // [요청 추가 항목]
             cumulativeReturn,       // 누적수익율
@@ -860,4 +995,7 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
     };
 }
 
-
+module.exports = {
+    analyzeTickerPerformance,
+    simulateStrategyPerformance
+};

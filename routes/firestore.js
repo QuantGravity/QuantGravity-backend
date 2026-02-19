@@ -21,37 +21,40 @@ const COLLECTION_RULES = {
     'tickers': (user, docId, data) => ['admin', 'G9'].includes(user.role),
     'ticker_prices': (user, docId, data) => ['admin'].includes(user.role),
     'notices': (user, docId, data) => ['admin'].includes(user.role),
+    
     // [추가] 메뉴 설정도 관리자만 수정 가능
     'menu_settings': (user, docId, data) => ['admin'].includes(user.role), 
+    
+    // [추가] stocks 컬렉션 권한 추가
+    'stocks': (user, docId, data) => ['admin', 'G9'].includes(user.role),
+
+    // ▼▼▼ [신규 추가] FMP 마스터 데이터 (관리자 전용) ▼▼▼
+    // 섹터 및 산업 분류는 시스템 기준이므로 관리자만 수정
+    'meta_sectors': (user, docId, data) => ['admin'].includes(user.role),
+    'meta_industries': (user, docId, data) => ['admin'].includes(user.role),
+    
+    // 상장폐지 및 티커 마스터 정보도 관리자 권한 필수
+    'meta_delisted': (user, docId, data) => ['admin'].includes(user.role),
+    'meta_tickers': (user, docId, data) => ['admin'].includes(user.role),
+    // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
     // 2. [개인 데이터 영역] 내 문서는 '나(docId)'만 수정 가능
     'user_strategies': (user, docId, data) => user.email === docId,
     'investment_tickers': (user, docId, data) => user.email === docId, 
-    
-    // ▼▼▼ [누락된 항목 추가] ▼▼▼
-    'favorite_groups': (user, docId, data) => user.email === docId,     // 관심종목 그룹
-    'favorite_tickers': (user, docId, data) => user.email === docId,    // 관심종목 상세
-    'user_analysis_jobs': (user, docId, data) => user.email === docId,  // [중요] 작업번호 관리
+    'favorite_groups': (user, docId, data) => user.email === docId,
+    'favorite_tickers': (user, docId, data) => user.email === docId,
+    'user_analysis_jobs': (user, docId, data) => user.email === docId,
+
     // [추가] 고객 문의 권한 설정
     'customer_inquiries': (user, docId, data) => {
-        // 관리자나 G9 등급은 모든 권한 허용
         if (['admin', 'G9'].includes(user.role)) return true;
-        
-        // 일반 사용자는 본인이 작성한 문서(userId가 본인 이메일)인 경우에만 허용
         if (data && data.userId === user.email) return true;
-        
-        // 상세 조회 시 docId가 user.email과 연관이 없으므로, 
-        // 리스트 조회나 신규 등록 시에는 기본적으로 true를 반환하고 세부 필터링은 API에서 처리
         return true; 
     },
-    // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
     // 3. [위험 구역] 회원 정보는 공통 API로 수정 금지
-    // [보강] 사용자 정보 조회 권한
     'users': (user, docId, data) => {
-        // 관리자라면 모든 유저 정보 조회 가능
         if (['admin', 'G9'].includes(user.role)) return true;
-        // 일반 유저는 본인 정보만 조회 가능
         return user.email === docId;
     },
 
@@ -60,14 +63,18 @@ const COLLECTION_RULES = {
     'limit_logs': (user, docId, data) => false
 };
 
-// [추가] null 값을 파이어스토어 삭제 명령(FieldValue.delete())으로 변환하는 재귀 함수
+// [수정 후] 
+// null 뿐만 아니라 "DELETE_FIELD" 문자열도 재귀적으로 찾아서 삭제 명령으로 변환
 function convertNullToDelete(obj) {
     for (const key in obj) {
-        if (obj[key] === null) {
-            // 값이 null이면 삭제 명령(FieldValue.delete())으로 교체
+        // 1. 값이 null 이거나 "DELETE_FIELD" 문자열이면 -> 삭제 명령으로 변경
+        if (obj[key] === null || obj[key] === "DELETE_FIELD") {
             obj[key] = admin.firestore.FieldValue.delete();
-        } else if (typeof obj[key] === 'object' && obj[key] !== null) {
-            // 객체 안에 또 객체가 있으면 안쪽까지 검사 (재귀 호출)
+        } 
+        // 2. 객체인 경우 (Firestore 객체 등 특수 객체 제외) 재귀 탐색
+        else if (typeof obj[key] === 'object' && obj[key] !== null) {
+            // Firestore FieldValue 객체 등은 건드리지 않음
+            if (obj[key].constructor && obj[key].constructor.name === 'FieldValue') continue;
             convertNullToDelete(obj[key]);
         }
     }

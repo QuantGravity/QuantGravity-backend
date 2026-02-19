@@ -27,9 +27,11 @@
     "express": "^5.2.1",
     "firebase-admin": "^13.6.0",
     "jsonwebtoken": "^9.0.3",
+    "multer": "^2.0.2",
     "mysql2": "^3.16.0",
     "node-cron": "^4.2.1",
     "nodemailer": "^7.0.12",
+    "xlsx": "^0.18.5",
     "yahoo-finance2": "^3.11.2"
   }
 }

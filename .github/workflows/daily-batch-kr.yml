@@ -1,0 +1,31 @@
+name: KR Market Daily Update
+# 설명: 한국 시장(KOSPI, KOSDAQ) 전용 데일리 업데이트 (매일 한국시간 18:00 실행)
+
+on:
+  schedule:
+    - cron: '0 9 * * *' # UTC 09:00 = KST 18:00
+  workflow_dispatch:
+
+jobs:
+  kr-daily-routine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake up Server
+        run: curl https://quantgravity-backend.onrender.com/
+      
+      # 1. 한국 주가 업데이트
+      - name: KR Stock Stock Price Update
+        timeout-minutes: 15
+        run: |
+          echo "🚀 [KR] 한국 시장 주가 업데이트 시작..."
+          curl -X POST https://quantgravity-backend.onrender.com/api/fmp/daily-update-all \
+          -H "Content-Type: application/json" \
+          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}" \
+          -d '{"days": 3, "market": "KR"}'
+
+      # 2. 마켓맵/통계 갱신 (한국장 반영)
+      - name: Update Market Stats
+        run: |
+          curl -X POST https://quantgravity-backend.onrender.com/api/batch/update-stats \
+          -H "Content-Type: application/json" \
+          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}"

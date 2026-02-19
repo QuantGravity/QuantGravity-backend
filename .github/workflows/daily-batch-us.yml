@@ -1,0 +1,41 @@
+name: US Market Daily Update
+# 설명: 미국 시장 전용 (매일 한국시간 아침 9시 실행)
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # UTC 00:00 = KST 09:00 (미국 장 마감 3시간 후)
+  workflow_dispatch:
+
+jobs:
+  us-daily-routine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake up Server
+        run: curl https://quantgravity-backend.onrender.com/
+
+      # 1. 마스터 동기화 (미국 위주)
+      # [수정] Authorization 헤더 대신 x-batch-key로 통일!
+      - name: Sync Master Data
+        run: |
+          curl -X POST https://quantgravity-backend.onrender.com/api/fmp/sync-index-master \
+          -H "Content-Type: application/json" \
+          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}"
+
+      # 2. 미국 주가 업데이트 (US 파라미터 전달)
+      # [확인] 여기는 아주 잘 작성했어!
+      - name: US Stock Price Update
+        timeout-minutes: 15
+        run: |
+          echo "🚀 [US] 미국 시장 주가 업데이트 시작..."
+          curl -X POST https://quantgravity-backend.onrender.com/api/fmp/daily-update-all \
+          -H "Content-Type: application/json" \
+          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}" \
+          -d '{"days": 3, "market": "US"}' 
+
+      # 3. 통계 갱신
+      # [수정] 여기도 x-batch-key 헤더 필수 추가!
+      - name: Update Market Stats
+        run: |
+          curl -X POST https://quantgravity-backend.onrender.com/api/batch/update-stats \
+          -H "Content-Type: application/json" \
+          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}"

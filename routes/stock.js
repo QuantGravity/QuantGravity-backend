@@ -7,171 +7,170 @@
 //   3. 중복 제거: getDailyStockData 호출 시 Map을 사용하여 날짜 기준 중복 데이터를 제거한다.
 //   4. 싸이클 엔진: 주가 데이터 조회 시 상승/하락 싸이클 및 historicMax 지표를 실시간 산출한다.
 // ===========================================================================
+
 const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 const firestore = admin.firestore();
 const { verifyToken } = require('../utils/authHelper');
+const { getTickerData, getDailyStockData } = require('../utils/stockHelper');
 
 // ============================================================
-// [신규 API] 티커 검색 및 필터링 (권한 제어 포함)
+// [기능 1] 통합 종목 조회 (만능 API) - 리팩토링 버전
 // ============================================================
-// [수정] verifyToken 미들웨어 추가 (req.user 사용 가능해짐)`
+router.get('/symbol-lookup', verifyToken, async (req, res) => {
+    try {
+        // 1. 프론트엔드에서 보낸 파라미터 수신
+        const { symbol, exchange, country, justList } = req.query;
+
+        // 2. 헬퍼 함수 호출 시 country 파라미터가 누락되지 않도록 주의!
+        const results = await getTickerData({
+            symbol,
+            exchange,
+            country, // 🛑 [핵심 수정] 이 부분이 빠져 있었어! 꼭 넣어줘야 해.
+            justList: justList === 'true'
+        });
+
+        if (symbol && !results) {
+            return res.json({ success: false, message: "Symbol not found" });
+        }
+
+        res.json({ 
+            success: true, 
+            count: Array.isArray(results) ? results.length : 1,
+            [symbol ? 'data' : 'symbols']: results 
+        });
+    } catch (error) {
+        console.error("Symbol Lookup Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// =============================================================
+// [기능 2] 티커 검색 (New: meta_tickers 기반 + ETF 관리 지원)
+// =============================================================
+// [기능 2] 티커 검색 및 전체 로드 (로컬 필터링 지원용)
 router.post('/ticker-search', verifyToken, async (req, res) => {
     try {
         const { type, keyword, userGrade } = req.body;
         
-        // [보안 강화] 토큰에서 직접 권한 확인 (위조 방지)
         const tokenRole = req.user ? req.user.role : null;
         const isAdmin = ['admin', 'G9'].includes(tokenRole);
-
-        // 1. [보안] 권한 체크 로직 수정
-        // 관리자(isAdmin)이거나, 프론트에서 VIP라고 보냈으면 통과
-        // 그 외(무료 유저)인 경우에만 제약 사항 체크
         const isFreeUser = !isAdmin && (!userGrade || userGrade === 'FREE');
 
-        if (isFreeUser && type === '2') {
-            return res.status(403).json({ 
-                error: "무료 등급 회원은 ETF 리스트를 조회할 수 없습니다." 
-            });
+        // 전체 리스트 확보 (getTickerData는 이미 정렬 및 기본 정규화가 되어 있다고 가정)
+        let allTickers = await getTickerData();
+
+        // [보안] 무료 유저인 경우 지수(^)가 아닌 데이터는 필터링하여 보안 유지
+        if (isFreeUser) {
+            allTickers = allTickers.filter(item => (item.id || "").startsWith('^'));
         }
 
-        // 2. Firestore에서 전체 티커 가져오기
-        const snapshot = await firestore.collection('tickers').get();
-        
-        const allTickers = snapshot.docs.map(doc => {
-            const fullData = doc.data();
-            const dataContent = fullData.metadata ? fullData.metadata : fullData;
-            return {
-                id: doc.id,
-                ...dataContent
-            };
-        });
+        // 클라이언트에서 'ALL'을 요청하면 필터링 없이 전체 반환 (로컬 캐싱용)
+        if (type === 'ALL') {
+            return res.json(allTickers);
+        }
 
-        // 3. 필터링 로직 실행
+        // 기존 하위 호환을 위한 서버 필터링 로직 (필요시 유지)
         const filteredList = allTickers.filter(item => {
-            const tCode = (item.id || item.ticker || "").toUpperCase();
-            const isIndex = tCode.startsWith('^'); 
-
-            // [보안] 무료 유저는 검색(9)을 하더라도 '지수'만 보여줌
-            // 관리자는 모든 종목 검색 가능
-            if (isFreeUser) {
-                if (!isIndex) return false; 
-            }
-
-            // 구분자별 로직
-            if (type === '1') { // [지수]
-                return isIndex;
-            } 
-            else if (type === '2') { // [지수ETF]
-                return !isIndex;
-            } 
-            else if (type === '9') { // [검색]
-                if (!keyword) return false;
-                const searchKey = keyword.toUpperCase().trim();
-
-                const kName = (item.ticker_name_kr || "").toUpperCase();
-                const desc = (item.description || "").toUpperCase();
-                const und = (item.underlying_ticker || "").toUpperCase();
-
-                return tCode.includes(searchKey) ||
-                       kName.includes(searchKey) ||
-                       desc.includes(searchKey) ||
-                       und.includes(searchKey);
-            }
+            const tCode = item.id.toUpperCase();
+            const isIndex = tCode.startsWith('^');
             
-            return false;
+            if (type === '1') return !isIndex; // 지수ETF 등
+            if (type === '8') return isIndex;  // 지수
+            return true;
         });
 
-        // 4. 정렬
-        filteredList.sort((a, b) => {
-            const aId = (a.id || a.ticker).toUpperCase();
-            const bId = (b.id || b.ticker).toUpperCase();
-            return aId.localeCompare(bId);
-        });
-
-        // 실제 권한 로그 출력 (디버깅용)
-        console.log(`[Ticker Search] Type:${type}, Key:${keyword}, Role:${tokenRole}, Grade:${userGrade} -> Result:${filteredList.length}건`);
-        
         res.json(filteredList);
 
     } catch (e) {
         console.error("Search API Error:", e);
-        res.status(500).json({ error: "검색 중 오류가 발생했습니다." });
+        res.status(500).json({ error: "데이터 로드 중 오류가 발생했습니다." });
     }
 });
 
-// ----------------------------------------------------------------
-// 3. 주가 데이터 조회 및 분석 API
-// ----------------------------------------------------------------
+// ============================================================
+// [기능 3] 티커 상세 속성 일괄 조회 (Bulk Attributes)
+// ============================================================
+router.post('/get-attributes-bulk', verifyToken, async (req, res) => {
+    try {
+        const { tickers } = req.body; 
+        if (!tickers || !Array.isArray(tickers) || tickers.length === 0) {
+            return res.json({});
+        }
 
-// 특정 티커의 싸이클 계산
+        const db = admin.firestore();
+        // ID를 알고 있으므로 map을 이용해 refs 생성
+        const refs = tickers.map(t => db.collection('stocks').doc(t));
+        
+        // Firestore의 getAll을 사용하여 읽기 (비용 절감 및 속도 향상)
+        const snapshots = await db.getAll(...refs);
+
+        const resultMap = {};
+        snapshots.forEach(doc => {
+            if (doc.exists) {
+                const d = doc.data();
+                // 필요한 필드만 추출해서 반환
+                resultMap[doc.id] = {
+                    leverage: d.leverage_factor || '1',
+                    underlying: d.underlying_ticker || '',
+                    name_kr: d.ticker_name_kr || '',
+                    confirm_status: d.confirm_status || 'N' // <--- 이 줄을 꼭 추가해야 해!
+                };
+            }
+        });
+
+        res.json(resultMap);
+
+    } catch (e) {
+        console.error("Bulk Attribute Error:", e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ============================================================
+// [기능 4] 주가 데이터 조회
+// ============================================================
 router.get('/daily-stock', async (req, res) => {
-// 모든 인자를 query에서 한 번에 구조 분해 할당
     const { ticker, startDate, endDate, upperRate: uR, lowerRate: lR } = req.query;
     const upperRate = parseFloat(uR) || 30; 
     const lowerRate = parseFloat(lR) || 15;
 
-    console.log(`[조회 시작] ticker: ${ticker}, StartDate: ${startDate}`); // 디버깅용
-
     try {
-        // 1. 쿼리 실행 (ticker 대소문자 무시 등 대비)
         const rows = await getDailyStockData(ticker, startDate, endDate);
 
-        console.log(`[쿼리 결과] 데이터 개수: ${rows.length}건`);
+        if (rows.length === 0) return res.json([]);
 
-        if (rows.length === 0) {
-            return res.json([]); // 데이터가 없으면 빈 배열 반환 -> 프론트에서 "데이터가 없습니다" 알림 발생
-        }
-
+        // 싸이클 분석 엔진 (기존 로직 유지)
         let hMax = -Infinity; 
         let rMax = parseFloat(rows[0].high_price); 
         let rMin = parseFloat(rows[0].low_price);  
         let currentStatus = "-";
 
-        const results = rows.map((row, index) => {
+        const results = rows.map((row) => {
             try {
                 const high = parseFloat(row.high_price);
                 const low = parseFloat(row.low_price);
                 const close = parseFloat(row.close_price);
                 
-                // 날짜 처리 방어 코드
-                if (!row.date) return null;
-                const dateObj = new Date(row.date);
-                if (isNaN(dateObj.getTime())) return null; // 유효하지 않은 날짜 패스
+                if (startDate && row.date < startDate) return null;
+                if (high > hMax) hMax = high;
 
-                const currentRowDate = dateObj.toISOString().split('T')[0];
-
-                // 1. historicMax (시작일 이후 갱신)
-                if (!startDate || currentRowDate >= startDate) {
-                    if (high > hMax) hMax = high;
-                }
-
-                // 2. 싸이클 판단 로직
                 let judgeDrop = ((low - rMax) / rMax * 100);
                 let judgeRise = ((high - rMin) / rMin * 100);
-
                 let prevStatus = currentStatus;
-                let turnToDown = "";
-                let turnToUp = "";
+                let turnToDown = "", turnToUp = "";
 
                 if (currentStatus !== "하락" && Math.abs(judgeDrop) >= lowerRate) {
-                    currentStatus = "하락";
-                    turnToDown = "O";
+                    currentStatus = "하락"; turnToDown = "O";
                 } else if (currentStatus !== "상승" && Math.abs(judgeRise) >= upperRate) {
-                    currentStatus = "상승";
-                    turnToUp = "O";
+                    currentStatus = "상승"; turnToUp = "O";
                 }
 
-                // 3. 싸이클 전환 및 극값 갱신
-                let renewedHigh = "";
-                let renewedLow = "";
-
-                if (prevStatus === "상승" && currentStatus === "하락") {
-                    rMin = low;
-                } else if (prevStatus === "하락" && currentStatus === "상승") {
-                    rMax = high;
-                } else {
+                let renewedHigh = "", renewedLow = "";
+                if (prevStatus === "상승" && currentStatus === "하락") rMin = low;
+                else if (prevStatus === "하락" && currentStatus === "상승") rMax = high;
+                else {
                     if (high > rMax) { rMax = high; renewedHigh = "O"; }
                     if (low < rMin) { rMin = low; renewedLow = "O"; }
                 }
@@ -187,109 +186,49 @@ router.get('/daily-stock', async (req, res) => {
                     historicMax: currentHMax,
                     dropFromHMax: currentHMax > 0 ? ((close - currentHMax) / currentHMax * 100).toFixed(2) : "0.00",
                     runningMax: rMax,
-                    closeFromRMax: ((close - rMax) / rMax * 100).toFixed(2),
                     minFromRMax: ((low - rMax) / rMax * 100).toFixed(2),
                     runningMin: rMin,
-                    closeFromRMin: ((close - rMin) / rMin * 100).toFixed(2),
                     maxFromRMin: ((high - rMin) / rMin * 100).toFixed(2),
-                    renewedHigh: renewedHigh,
-                    renewedLow: renewedLow,
-                    turnToDown: turnToDown,
-                    turnToUp: turnToUp,
+                    renewedHigh, renewedLow, turnToDown, turnToUp,
                     cycleStatus: currentStatus
                 };
-            } catch (e) {
-                console.error(`Row mroutering error at index ${index}:`, e);
-                return null;
-            }
-        }).filter(item => item !== null); // 에러 난 행 제외
+            } catch (e) { return null; }
+        }).filter(item => item !== null);
 
         res.json(results);
     } catch (err) {
-        console.error("[백엔드 에러]:", err.message);
+        console.error("[Daily Stock Error]:", err.message);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 티커 전체 조회
-// [변경] Firestore에서 가져오기 (백엔드가 프록시 역할)
-// 티커 전체 조회
-// [변경] 지수(^) 우선 정렬 로직 및 데이터 평탄화 적용
-router.get('/tickers', async (req, res) => {
-    try {
-        // [수정] orderBy('ticker') 대신 데이터를 가져온 후 커스텀 정렬을 수행합니다.
-        const snapshot = await firestore.collection('tickers').get();
-        
-        const tickers = snapshot.docs.map(doc => {
-            const fullData = doc.data();
-            // [구조 통일] metadata 주머니가 있으면 풀어서 반환, 없으면 그대로 반환
-            const dataContent = fullData.metadata ? fullData.metadata : fullData;
-            
-            return {
-                id: doc.id,
-                ...dataContent
-            };
-        });
-
-        // [핵심 로직] ^로 시작하는 지수를 상단으로 보내는 정렬
-        tickers.sort((a, b) => {
-            const aId = (a.id || a.ticker || "").trim().toUpperCase();
-            const bId = (b.id || b.ticker || "").trim().toUpperCase();
-            
-            const aIsIndex = aId.startsWith('^');
-            const bIsIndex = bId.startsWith('^');
-
-            if (aIsIndex === bIsIndex) {
-                // numeric: true를 주면 문자열 속 숫자 정렬도 자연스러워집니다.
-                return aId.localeCompare(bId, undefined, { numeric: true, sensitivity: 'base' });
-            }
-            
-            return aIsIndex ? -1 : 1;
-        });
-
-        // 기존 프론트엔드들이 기대하는 JSON 형식 그대로 반환
-        res.json(tickers); 
-    } catch (err) {
-        console.error("Firestore 조회 에러:", err);
-        res.status(500).json({ error: "클라우드 데이터를 불러올 수 없습니다." });
-    }
-});
-
-// [Backend] 사용자별 관심종목 전제 데이터 반환 API
+// ============================================================
+// [기능 5] 사용자별 관심종목 조회
+// ============================================================
 router.get('/user/investments/:email', verifyToken, async (req, res) => {
     try {
         const { email } = req.params;
-        const docRef = firestore.collection('investment_tickers').doc(email);
-        const doc = await docRef.get();
-
+        const doc = await firestore.collection('investment_tickers').doc(email).get();
         if (!doc.exists) return res.status(200).json([]);
 
         const data = doc.data();
         let tickerMap = {};
 
-        // 헬퍼 함수: DB 필드(fee_rate, tax_rate)를 프론트에서 쓰는 명칭으로 매핑
         const extractItem = (item, key) => ({
             ticker: item.ticker || key,
             ticker_name_kr: item.ticker_name_kr || "",
             description: item.description || "",
-            // [중요] DB 필드명을 그대로 유지하여 프론트 전달
-            fee_rate: (item.fee_rate !== undefined && item.fee_rate !== null) ? item.fee_rate : 0,
-            tax_rate: (item.tax_rate !== undefined && item.tax_rate !== null) ? item.tax_rate : 0,
+            fee_rate: item.fee_rate || 0,
+            tax_rate: item.tax_rate || 0,
             createdAt: item.createdAt || ""
         });
 
-        // [사진 구조 반영] investments 객체 내부 순회
-        if (data.investments && typeof data.investments === 'object') {
+        if (data.investments) {
             Object.keys(data.investments).forEach(key => {
-                const itemData = data.investments[key];
-                // null 체크 (삭제 대기 데이터 등 방어 코드)
-                if (itemData) {
-                    tickerMap[key] = extractItem(itemData, key);
-                }
+                if(data.investments[key]) tickerMap[key] = extractItem(data.investments[key], key);
             });
         }
-
-        // Dot notation (investments.TQQQ 형태) 필드가 혼재할 경우를 대비한 방어 코드
+        
         Object.keys(data).forEach(key => {
             if (key.startsWith('investments.') && data[key]) {
                 const tickerCode = key.split('.')[1];
@@ -297,64 +236,53 @@ router.get('/user/investments/:email', verifyToken, async (req, res) => {
             }
         });
 
-        const tickerArray = Object.values(tickerMap).sort((a, b) => a.ticker.localeCompare(b.ticker));
-        res.status(200).json(tickerArray);
+        res.status(200).json(Object.values(tickerMap).sort((a, b) => a.ticker.localeCompare(b.ticker)));
     } catch (error) {
-        console.error("[Get investments Error]:", error);
         res.status(500).json({ error: "관심종목 로드 실패" });
     }
 });
 
-// ----------------------------------------------------------------
-// [수정] 주가 데이터 조회 함수 (Firestore 전용)
-// ----------------------------------------------------------------
-async function getDailyStockData(ticker, start, end) {
+// [기능] 섹터/산업 마스터 데이터 조회 (한글 매핑용)
+router.get('/meta-sectors', verifyToken, async (req, res) => {
     try {
-        const doc = await firestore.collection('ticker_prices').doc(ticker).get();
+        const db = admin.firestore();
+        // GICS_Standard 문서 혹은 meta_sectors 컬렉션 전체를 가져옴
+        const snapshot = await db.collection('meta_sectors').get();
         
-        if (!doc.exists) {
-            console.warn(`Firestore에 데이터 없음: ${ticker}`);
-            return [];
-        }
+        let sectorMap = {};
 
-        const data = doc.data();
-        const labels = data.labels || [];
-        const prices = data.prices || [];
-
-        // 1. 데이터 매핑 (날짜와 가격을 묶음)
-        let rawRows = labels.map((date, index) => {
-            const dDate = date.includes('T') ? date.split('T')[0] : date;
-            const p = prices[index];
-
-            return {
-                date: dDate,
-                close_price: p && typeof p === 'object' ? p.c : p,
-                open_price:  p && typeof p === 'object' ? p.o : p,
-                high_price:  p && typeof p === 'object' ? p.h : p,
-                low_price:   p && typeof p === 'object' ? p.l : p
-            };
-        });
-
-        // 2. [핵심 수정] 날짜(date) 기준 중복 제거 (Map 사용)
-        const uniqueMap = new Map();
-        rawRows.forEach(row => {
-            // 날짜 범위 필터링을 여기서 미리 수행하여 불필요한 연산 감소
-            if ((!start || row.date >= start) && (!end || row.date <= end)) {
-                uniqueMap.set(row.date, row); // 같은 날짜가 있으면 덮어씌움 (중복 제거)
+        // 문서 구조에 따라 다르지만, 보통 { 영문명: 한글명 } 형태의 맵을 기대함
+        // 만약 DB가 계층형(Hierarchy)이라면 여기서 평탄화(Flatten)해서 내려주는 것이 프론트에서 쓰기 편함
+        
+        snapshot.forEach(doc => {
+            const data = doc.data();
+            // 예: data = { "Technology": "기술", "Software": "소프트웨어" ... }
+            // 또는 data.hierarchy 구조일 경우 재귀적으로 파싱 필요
+            // 여기서는 단순 병합으로 처리 (필요시 DB구조에 맞춰 수정)
+            Object.assign(sectorMap, data);
+            
+            // 만약 hierarchy 필드에 들어있다면:
+            if (data.hierarchy) {
+                // hierarchy 순회하며 매핑 추출 로직 (예시)
+                for (const [secEng, content] of Object.entries(data.hierarchy)) {
+                    // content가 한글명 스트링이거나, 객체 내부에 한글명이 있거나
+                    // DB 구조에 맞춰 매핑 추가
+                }
+            }
+            
+            // [중요] 사용자가 수기로 관리하는 'translations' 필드가 있다고 가정하거나
+            // 혹은 프론트엔드에서 하드코딩된 맵을 기본으로 쓰고 DB는 보정용으로 쓸 수도 있음.
+            if (data.translations) {
+                Object.assign(sectorMap, data.translations);
             }
         });
 
-        // 3. 중복 제거된 데이터를 배열로 변환 후 날짜 오름차순 정렬
-        const sortedRows = Array.from(uniqueMap.values()).sort((a, b) => {
-            return a.date.localeCompare(b.date);
-        });
+        res.json(sectorMap);
 
-        return sortedRows;
-
-    } catch (err) {
-        console.error(`Firestore 조회 에러 (${ticker}):`, err.message);
-        throw err;
+    } catch (error) {
+        console.error("Sector Load Error:", error);
+        res.status(500).json({});
     }
-}
+});
 
-module.exports = router;
+module.exports = router; // 기존처럼 라우터 자체를 내보냄
