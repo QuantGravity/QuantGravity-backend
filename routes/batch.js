@@ -26,42 +26,201 @@ const verifyBatchOrAdmin = (req, res, next) => {
     return verifyToken(req, res, next);
 };
 
-// 라우터 설정 
-// 호출 예시: POST /batch/update-stats { "tickers": ["AAPL", "TSLA"] }
-// ⚡ [수정] 인증 추가 및 빈 파라미터일 경우 전체 종목 백그라운드 업데이트
+// 날짜 배열 유틸리티 함수
+function getDatesInRange(startStr, endStr) {
+    const dates = [];
+    let current = new Date(startStr);
+    const end = new Date(endStr);
+    while (current <= end) {
+        dates.push(current.toISOString().split('T')[0]);
+        current.setDate(current.getDate() + 1);
+    }
+    return dates;
+}
+
+// 🌐 국가별 타임존을 적용하여 오늘 날짜(YYYY-MM-DD)를 구하는 함수
+function getTodayByCountry(country) {
+    const timeZone = (country === 'KR') ? 'Asia/Seoul' : 'America/New_York';
+    const formatter = new Intl.DateTimeFormat('en-CA', { 
+        timeZone: timeZone, 
+        year: 'numeric', month: '2-digit', day: '2-digit' 
+    });
+    return formatter.format(new Date());
+}
+
+// 종목 통계데이터 집계
 router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
     try {
+        const { country, startSymbol, endSymbol, startDate, endDate } = req.body;
         let tickers = req.body.tickers || [];
         
-        // 파라미터가 없으면(빈 배열이면) 전체 Active 종목 가져오기
+        // 1. 파라미터가 없으면 Active 종목 필터링
         if (tickers.length === 0) {
-            console.log("👉 [Batch] 파라미터 없음: 전체 Active 종목을 대상으로 설정합니다.");
-            const snapshot = await firestore.collection('stocks').where('active', '==', true).select().get();
-            tickers = snapshot.docs.map(doc => doc.id);
+            console.log("👉 [Batch] 대상 종목 리스트 확보 중...");
+            let query = firestore.collection('stocks').where('active', '==', true);
+            const snapshot = await query.select().get();
+            tickers = snapshot.docs.map(doc => doc.id).sort();
+            
+            if (startSymbol) tickers = tickers.filter(t => t >= startSymbol);
+            if (endSymbol) tickers = tickers.filter(t => t <= endSymbol);
         }
 
-        // 전체 종목(수천 개)일 경우 타임아웃이 발생할 수 있으므로, 응답을 먼저 보냄
-        res.json({ result: 'Batch triggered successfully (Background)', count: tickers.length });
+        const todayStr = getTodayByCountry(country);
+        const targetDates = getDatesInRange(startDate || todayStr, endDate || startDate || todayStr);
 
-        // 백그라운드 처리 (메모리 터짐 방지를 위해 for-of 순차 처리)
+        res.json({ result: 'Batch triggered (Background)', count: tickers.length, dates: targetDates.length });
+
         setImmediate(async () => {
-            console.log(`🚀 [Batch] 통계 업데이트 백그라운드 처리 시작 (총 ${tickers.length}개)`);
-            let successCount = 0;
+            console.log(`🚀 [Batch] 통계 업데이트 시작 (국가: ${country || 'US'}, 기간: ${targetDates[0]}~${targetDates[targetDates.length-1]})`);
             
-            for (const ticker of tickers) {
-                try {
-                    // updateStockStats 함수가 어딘가 정의되어 호출된다고 가정 (기존 로직 유지)
-                    if (typeof updateStockStats === 'function') {
-                        await updateStockStats(ticker);
-                    }
-                    successCount++;
-                    // 서버 부하 조절을 위해 아주 짧은 딜레이 추가 (선택적)
-                    // await new Promise(r => setTimeout(r, 50)); 
-                } catch (e) {
-                    console.error(`❌ [Batch] ${ticker} 통계 업데이트 실패:`, e.message);
+            // 2. 테마 맵핑 데이터 로드
+            const themeMap = {};
+            const themesSnap = await firestore.collection('market_themes').get();
+            themesSnap.forEach(doc => {
+                const d = doc.data();
+                if (d.tickers && Array.isArray(d.tickers)) {
+                    d.tickers.forEach(t => {
+                        if (!themeMap[t.symbol]) themeMap[t.symbol] = [];
+                        themeMap[t.symbol].push(doc.id);
+                    });
                 }
+            });
+
+            // ⚡ 종목 마스터 정보 로드 및 '추정 주식수' 계산
+            console.log("📊 [Batch] 종목별 주식 수 계산 중...");
+            const stockMasterInfo = {};
+            const stocksSnap = await firestore.collection('stocks').where('active', '==', true).get();
+            
+            stocksSnap.forEach(doc => {
+                const data = doc.data();
+                const industry = data.industry || '';
+                const snapshot = data.snapshot || {};
+                
+                const currentMktCap = Number(String(snapshot.mktCap).replace(/,/g, '')) || 0;
+                const currentPrice = Number(String(snapshot.price).replace(/,/g, '')) || 0;
+                
+                let estimatedShares = 0;
+                if (currentPrice > 0 && currentMktCap > 0) {
+                    estimatedShares = currentMktCap / currentPrice;
+                }
+                
+                stockMasterInfo[doc.id] = { industry, estimatedShares };
+            });
+
+            // 3. 날짜별 Loop
+            for (const targetDate of targetDates) {
+                const targetYear = parseInt(targetDate.split('-')[0]);
+                const requiredYears = [String(targetYear), String(targetYear - 1), String(targetYear - 2)];
+                const docId = `${targetDate}_${country || 'US'}`;
+                const docRef = firestore.collection('meta_ticker_stats').doc(docId);
+                
+                let successCount = 0;
+                let chunkIndex = 0;
+                const WRITE_CHUNK_SIZE = 100; // 파이어스토어에 저장할 종목 단위
+
+                // ⚡ [핵심] 500개 단위로 Chunk 나누기
+                for (let i = 0; i < tickers.length; i += WRITE_CHUNK_SIZE) {
+                    const chunkTickers = tickers.slice(i, i + WRITE_CHUNK_SIZE);
+                    const batchData = {}; 
+
+                    // 4. 메모리 폭주를 막기 위해 500개 안에서 다시 100개씩 순차/병렬 처리
+                    for (let j = 0; j < chunkTickers.length; j += 100) {
+                        const subTickers = chunkTickers.slice(j, j + 100);
+                        
+                        await Promise.all(subTickers.map(async (ticker) => {
+                            try {
+                                const yearPromises = requiredYears.map(y => 
+                                    firestore.collection('stocks').doc(ticker).collection('annual_data').doc(y).get()
+                                );
+                                const yearDocs = await Promise.all(yearPromises);
+
+                                let combinedHistory = [];
+                                yearDocs.forEach(doc => {
+                                    if (doc.exists) {
+                                        const dataList = doc.data().data || []; 
+                                        if (Array.isArray(dataList)) {
+                                            combinedHistory = combinedHistory.concat(dataList);
+                                        }
+                                    }
+                                });
+
+                                combinedHistory.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+                                if (combinedHistory.length === 0) return;
+
+                                const idx = combinedHistory.findIndex(h => h.date === targetDate);
+                                if (idx === -1) return;
+
+                                const todayClose = combinedHistory[idx].close;
+                                
+                                const masterInfo = stockMasterInfo[ticker] || { industry: '', estimatedShares: 0 };
+                                const calculatedMktCap = Math.round(masterInfo.estimatedShares * todayClose);
+                                const myThemes = themeMap[ticker] || [];
+
+                                const stats = {
+                                    marketCap: calculatedMktCap,
+                                    industry: masterInfo.industry,
+                                    themes: myThemes, // 🚀 테마 1~5 대신 배열 통째로 삽입!
+                                    perf_vs_prev: {},
+                                    perf_vs_low: {},
+                                    perf_vs_high: {}
+                                };
+
+                                [1, 2, 3, 4, 5, 10, 20, 40, 60, 120, 240, 480].forEach(d => {
+                                    if (combinedHistory[idx + d]) {
+                                        const pastClose = combinedHistory[idx + d].close;
+                                        stats.perf_vs_prev[`${d}d`] = parseFloat((((todayClose - pastClose) / pastClose) * 100).toFixed(2));
+                                    }
+                                });
+
+                                [5, 10, 20, 40, 60, 120, 240, 480].forEach(d => {
+                                    if (combinedHistory.length > idx + d) {
+                                        const slice = combinedHistory.slice(idx, idx + d);
+                                        const minLow = Math.min(...slice.map(h => h.low));
+                                        const maxHigh = Math.max(...slice.map(h => h.high));
+                                        
+                                        stats.perf_vs_low[`${d}d`] = parseFloat((((todayClose - minLow) / minLow) * 100).toFixed(2));
+                                        stats.perf_vs_high[`${d}d`] = parseFloat((((todayClose - maxHigh) / maxHigh) * 100).toFixed(2));
+                                    }
+                                });
+
+                                batchData[ticker] = stats;
+                                successCount++;
+
+                            } catch (e) {
+                                console.error(`❌ ${ticker} 집계 에러:`, e.message);
+                            }
+                        }));
+                    }
+
+                    // ⚡ 서브 컬렉션(chunks)에 batch_0, batch_1 포맷으로 저장
+                    if (Object.keys(batchData).length > 0) {
+                        try {
+                            // 2. 개별 청크 저장 시 에러가 나도 프로세스가 죽지 않게 try-catch 사용
+                            await docRef.collection('chunks').doc(`batch_${chunkIndex}`).set(batchData);
+                            console.log(`📦 [Batch] batch_${chunkIndex} 저장 완료 (${Object.keys(batchData).length}종목)`);
+                            chunkIndex++;
+                        } catch (saveError) {
+                            // 3. 에러 발생 시 로그만 찍고 다음으로 넘어가도록 처리
+                            console.error(`❌ [Batch Error] batch_${chunkIndex} 저장 중 에러 발생:`, saveError.message);
+                            // 필요하다면 여기서 알림을 보내거나 기록
+                        }
+                    }
+                }
+                
+                // ⚡ 부모 문서에 메타 데이터 업데이트
+                await docRef.set({
+                    date: targetDate,
+                    country: country || 'US',
+                    isChunked: true,
+                    chunkCount: chunkIndex,
+                    totalCount: successCount,
+                    updatedAt: new Date().toISOString()
+                }, { merge: true });
+
+                console.log(`✅ [Batch] ${docId} 통계 완료 (총 ${successCount}건, ${chunkIndex}개 Chunk로 분할 저장됨)`);
             }
-            console.log(`✅ [Batch] 통계 업데이트 최종 완료! (성공: ${successCount} / 전체: ${tickers.length})`);
+            console.log(`🏁 [Batch] 전체 작업 완료`);
         });
 
     } catch (error) {

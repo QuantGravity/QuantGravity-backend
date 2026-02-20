@@ -36,6 +36,8 @@ jobs:
       # [수정] 여기도 x-batch-key 헤더 필수 추가!  
       - name: Update Market Stats
         run: |
+          echo "📊 [US] 미국 시장 통계 집계 시작..."
           curl -X POST https://quantgravity-backend.onrender.com/api/batch/update-stats \
           -H "Content-Type: application/json" \
-          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}"
+          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}" \
+          -d '{"country": "US"}'

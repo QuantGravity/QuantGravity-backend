@@ -269,22 +269,28 @@ router.post('/load-stock-data', verifyToken, async (req, res) => {
         res.json(result);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 // ===========================================================================
 // [2.1] 주가 전체 업데이트 (진단 로그 강화 + 미국시간 + 에러 추적)
 // ⚡ [수정] 아무나 호출하지 못하도록 verifyBatchOrAdmin 미들웨어 장착
 // ===========================================================================
 router.post('/daily-update-all', verifyBatchOrAdmin, async (req, res) => {
-    // [Helper] 미국 동부 시간 기준 날짜 계산 함수
-    const getUSDate = (offsetDays = 0) => {
+    // 🌐 [Helper] 국가(Market) 타임존 기준 날짜 계산 함수
+    const getDateByMarket = (offsetDays = 0, market = 'US') => {
+        // KR이면 서울, 그 외(US, ALL 등)는 뉴욕 시간 적용
+        const timeZone = (market === 'KR') ? 'Asia/Seoul' : 'America/New_York';
+        
         const now = new Date();
-        const usTimeStr = now.toLocaleString("en-US", {
-            timeZone: "America/New_York",
+        const timeStr = now.toLocaleString("en-US", {
+            timeZone: timeZone,
             year: "numeric", month: "2-digit", day: "2-digit"
         });
-        const [m, d, y] = usTimeStr.split('/');
-        const usDate = new Date(`${y}-${m}-${d}`);
-        usDate.setDate(usDate.getDate() - offsetDays);
-        return usDate.toISOString().split('T')[0];
+        
+        const [m, d, y] = timeStr.split('/');
+        const targetDate = new Date(`${y}-${m}-${d}`);
+        targetDate.setDate(targetDate.getDate() - offsetDays);
+        
+        return targetDate.toISOString().split('T')[0];
     };
 
     // [Helper] 날짜 범위 생성 함수

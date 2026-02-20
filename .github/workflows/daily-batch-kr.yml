@@ -26,6 +26,8 @@ jobs:
       # 2. 마켓맵/통계 갱신 (한국장 반영)   
       - name: Update Market Stats
         run: |
+          echo "📊 [KR] 한국 시장 통계 집계 시작..."
           curl -X POST https://quantgravity-backend.onrender.com/api/batch/update-stats \
           -H "Content-Type: application/json" \
-          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}"
+          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}" \
+          -d '{"country": "KR"}'
