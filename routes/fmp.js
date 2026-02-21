@@ -317,7 +317,7 @@ router.post('/daily-update-all', verifyBatchOrAdmin, async (req, res) => {
         // 2순위: 파라미터로 days가 왔거나(배치잡 등), 둘 다 없으면 기본 3일 적용
         const requestDays = days ? parseInt(days) : 3;
         for (let i = 0; i < requestDays; i++) {
-            targetDates.push(getUSDate(i));
+           targetDates.push(getDateByMarket(i, targetMarket));
         }
     }
 
