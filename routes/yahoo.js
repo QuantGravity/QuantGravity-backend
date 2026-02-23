@@ -11,7 +11,7 @@ const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 const firestore = admin.firestore();
-const { verifyToken } = require('../utils/authHelper');
+const { verifyToken, verifyBatchOrAdmin } = require('../utils/authHelper');
 const YahooFinance = require('yahoo-finance2').default;
 
 // server.js 상단, YahooFinance 생성 부분 수정

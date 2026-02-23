@@ -12,7 +12,7 @@ const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 const firestore = admin.firestore();
-const { verifyToken } = require('../utils/authHelper');
+const { verifyToken, verifyBatchOrAdmin } = require('../utils/authHelper');
 const { getTickerData, getDailyStockData } = require('../utils/stockHelper');
 
 // ============================================================
@@ -282,6 +282,43 @@ router.get('/meta-sectors', verifyToken, async (req, res) => {
     } catch (error) {
         console.error("Sector Load Error:", error);
         res.status(500).json({});
+    }
+});
+
+// [stocks.js]
+// 비활성 종목 리스트 조회 API
+router.get('/inactive-list', verifyBatchOrAdmin, async (req, res) => {
+    try {
+        // 1. 쿼리 파라미터에서 국가(country) 값 추출
+        const { country } = req.query; 
+
+        const db = admin.firestore();
+        
+        // 2. 기본 쿼리: active가 false인 문서
+        let stockQuery = db.collection('stocks').where('active', '==', false);
+
+        // 3. 국가 값이 전달된 경우 국가 조건 추가 필터링
+        // 주의: 파이어스토어 stocks 컬렉션에 국가를 저장하는 필드명이 'country'가 맞는지 확인 필요해!
+        if (country) {
+            stockQuery = stockQuery.where('country', '==', country);
+        }
+
+        const snapshot = await stockQuery.get();
+
+        const inactiveList = [];
+        snapshot.forEach(doc => {
+            inactiveList.push({
+                id: doc.id,
+                symbol: doc.data().symbol,
+                name_en: doc.data().name_en,
+                name_ko: doc.data().name_ko
+            });
+        });
+
+        res.json({ success: true, count: inactiveList.length, data: inactiveList });
+    } catch (error) {
+        console.error("Fetch Inactive Stocks Error:", error);
+        res.status(500).json({ error: error.message });
     }
 });
 

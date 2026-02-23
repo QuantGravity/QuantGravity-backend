@@ -11,7 +11,7 @@ const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 const firestore = admin.firestore();
-const { verifyToken } = require('../utils/authHelper');
+const { verifyToken, verifyBatchOrAdmin } = require('../utils/authHelper');
 
 // ============================================================
 // 각 컬렉션 별로 사용자권한 점검 - 수작업으로 관리해줘야 함.
@@ -36,6 +36,19 @@ const COLLECTION_RULES = {
     // 상장폐지 및 티커 마스터 정보도 관리자 권한 필수
     'meta_delisted': (user, docId, data) => ['admin'].includes(user.role),
     'meta_tickers': (user, docId, data) => ['admin'].includes(user.role),
+
+    // 종목별 통계 데이터 (종목 Map 등에서 사용)
+    // 날짜별/국가별 통계 정보이므로 관리자만 배치 작업으로 업데이트함
+    'meta_ticker_stats': (user, docId, data) => ['admin'].includes(user.role),
+    
+    // 통계 데이터의 하위 chunk 컬렉션 접근을 위해 추가
+    // (URL 인코딩된 경로로 들어올 경우를 대비해 규칙에 포함)
+    'meta_ticker_stats_chunks': (user, docId, data) => ['admin'].includes(user.role),
+
+    // [추가] 일반 통계 및 시장 지표 데이터
+    // 사용자는 '조회'만 가능해야 하므로, API를 통한 '쓰기'는 관리자만 허용
+    'meta_stats': (user, docId, data) => ['admin', 'G9'].includes(user.role),
+
     // ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
     // 2. [개인 데이터 영역] 내 문서는 '나(docId)'만 수정 가능
@@ -303,6 +316,85 @@ router.get('/detail/:collectionName/:docId', verifyToken, async (req, res) => {
 
     } catch (error) {
         console.error("[Detail Fetch Error]:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 컬렉션 전체를 삭제하는 공통 함수 (서브 컬렉션 포함 가능)
+async function deleteCollection(db, collectionPath, batchSize = 500) {
+    const collectionRef = db.collection(collectionPath);
+    const query = collectionRef.orderBy('__name__').limit(batchSize);
+
+    return new Promise((resolve, reject) => {
+        deleteQueryBatch(db, query, resolve).catch(reject);
+    });
+}
+
+async function deleteQueryBatch(db, query, resolve) {
+    const snapshot = await query.get();
+
+    // 더 이상 지울 문서가 없으면 종료
+    if (snapshot.size === 0) {
+        resolve();
+        return;
+    }
+
+    const batch = db.batch();
+    snapshot.docs.forEach((doc) => {
+        // 만약 chunks 같은 서브 컬렉션이 있다면 여기서도 처리가 필요할 수 있어.
+        // stocks의 경우 서브 컬렉션이 없다면 바로 delete 가능
+        batch.delete(doc.ref);
+    });
+
+    await batch.commit();
+
+    // 다음 배치를 위해 재귀 호출 (프로세스 넥스트 틱 사용으로 스택 오버플로 방지)
+    process.nextTick(() => {
+        deleteQueryBatch(db, query, resolve);
+    });
+}
+
+// 관리자용 삭제 엔드포인트
+// 관리자용 재귀적 삭제 엔드포인트
+router.post('/delete-recursive', verifyBatchOrAdmin, async (req, res) => {
+    const { collectionName } = req.body;
+    if (!collectionName) return res.status(400).json({ error: "컬렉션 이름 누락" });
+
+    try {
+        const db = admin.firestore();
+        const collectionRef = db.collection(collectionName);
+        
+        // listDocuments()는 데이터가 없는 '유령 문서'도 모두 가져온다.
+        const docRefs = await collectionRef.listDocuments();
+
+        if (docRefs.length === 0) {
+            return res.json({ success: true, isFinished: true, deletedCount: 0 });
+        }
+
+        // 한 번에 처리할 배치 크기 제한 (Firestore 제한: 500개)
+        const batchSize = 500;
+        const targetDocs = docRefs.slice(0, batchSize);
+        
+        // 각 문서의 하위 서브 컬렉션까지 삭제하려면 아래 함수를 재귀적으로 호출해야 함
+        // 여기서는 일단 해당 문서 레벨에서의 삭제를 처리
+        for (const docRef of targetDocs) {
+            // 해당 문서의 하위 서브 컬렉션 리스트를 가져옴
+            const subCollections = await docRef.listCollections();
+            for (const subCol of subCollections) {
+                // 서브 컬렉션 내의 문서들도 삭제 (재귀적 처리가 필요할 경우 공통함수 호출)
+                await db.recursiveDelete(subCol); 
+            }
+            // 문서 본인 삭제
+            await docRef.delete();
+        }
+
+        res.json({ 
+            success: true, 
+            isFinished: docRefs.length <= batchSize, 
+            deletedCount: targetDocs.length 
+        });
+    } catch (error) {
+        console.error("Delete Error:", error);
         res.status(500).json({ error: error.message });
     }
 });

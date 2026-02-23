@@ -11,20 +11,10 @@ const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 const firestore = admin.firestore();
-const { verifyToken } = require('../utils/authHelper');
+const { verifyToken, verifyBatchOrAdmin } = require('../utils/authHelper');
 const { logTraffic } = require('../utils/logger');
 const { performAnalysisInternal } = require('../utils/analysisEngine');
 const { getDaysDiff } = require('../utils/math');
-
-// ⚡ [추가] 배치 & 관리자 공용 인증 미들웨어 (fmp.js와 동일)
-const BATCH_SECRET = process.env.BATCH_SECRET_KEY || 'quantgravity_batch_secret_20260218'; 
-const verifyBatchOrAdmin = (req, res, next) => {
-    const batchKey = req.headers['x-batch-key'];
-    if (batchKey && batchKey === BATCH_SECRET) {
-        return next();
-    }
-    return verifyToken(req, res, next);
-};
 
 // 날짜 배열 유틸리티 함수
 function getDatesInRange(startStr, endStr) {
@@ -49,17 +39,36 @@ function getTodayByCountry(country) {
 }
 
 // 종목 통계데이터 집계
+// 종목 통계데이터 집계
 router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
     try {
         const { country, startSymbol, endSymbol, startDate, endDate } = req.body;
         let tickers = req.body.tickers || [];
         
-        // 1. 파라미터가 없으면 Active 종목 필터링
+        // 1. 대상 종목 리스트 확보
         if (tickers.length === 0) {
-            console.log("👉 [Batch] 대상 종목 리스트 확보 중...");
+            console.log(`👉 [Batch] ${country || '전체'} 대상 종목 리스트 확보 중...`);
+            
             let query = firestore.collection('stocks').where('active', '==', true);
+            
+            if (country) {
+                query = query.where('country', '==', country);
+            }
+
             const snapshot = await query.select().get();
-            tickers = snapshot.docs.map(doc => doc.id).sort();
+            tickers = snapshot.docs.map(doc => doc.id);
+            
+            // 🌟 [수정 포인트] 지수(Index)는 country 필드가 누락되어 있을 수 있으므로 수동으로 강제 포함
+            const coreIndices = country === 'KR' 
+                ? ['^KS11', '^KQ11', '^KS200', '^KRX100'] 
+                : ['^GSPC', '^IXIC', '^NDX', '^DJI', '^RUT', '^VIX', '^W5000']; // 기본값 US
+            
+            coreIndices.forEach(idx => {
+                if (!tickers.includes(idx)) tickers.push(idx);
+            });
+
+            // 배열에 합친 후 전체 정렬
+            tickers.sort();
             
             if (startSymbol) tickers = tickers.filter(t => t >= startSymbol);
             if (endSymbol) tickers = tickers.filter(t => t <= endSymbol);
@@ -73,7 +82,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
         setImmediate(async () => {
             console.log(`🚀 [Batch] 통계 업데이트 시작 (국가: ${country || 'US'}, 기간: ${targetDates[0]}~${targetDates[targetDates.length-1]})`);
             
-            // 2. 테마 맵핑 데이터 로드
+            // 2. 데이터 준비 (테마, 산업 정보 등)
             const themeMap = {};
             const themesSnap = await firestore.collection('market_themes').get();
             themesSnap.forEach(doc => {
@@ -86,44 +95,66 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                 }
             });
 
-            // ⚡ 종목 마스터 정보 로드 및 '추정 주식수' 계산
-            console.log("📊 [Batch] 종목별 주식 수 계산 중...");
             const stockMasterInfo = {};
             const stocksSnap = await firestore.collection('stocks').where('active', '==', true).get();
-            
             stocksSnap.forEach(doc => {
                 const data = doc.data();
-                const industry = data.industry || '';
-                const snapshot = data.snapshot || {};
-                
-                const currentMktCap = Number(String(snapshot.mktCap).replace(/,/g, '')) || 0;
-                const currentPrice = Number(String(snapshot.price).replace(/,/g, '')) || 0;
-                
-                let estimatedShares = 0;
-                if (currentPrice > 0 && currentMktCap > 0) {
-                    estimatedShares = currentMktCap / currentPrice;
-                }
-                
-                stockMasterInfo[doc.id] = { industry, estimatedShares };
+                stockMasterInfo[doc.id] = { industry: data.industry || '' };
             });
 
-            // 3. 날짜별 Loop
+            // 3. 날짜별 루프
             for (const targetDate of targetDates) {
+                // -------------------------------------------------------------------
+                // [Optimization] 1단계: 주말 체크 (토=6, 일=0)
+                // -------------------------------------------------------------------
+                const dayOfWeek = new Date(targetDate).getDay(); 
+                if (dayOfWeek === 0 || dayOfWeek === 6) {
+                    console.log(`⏭️ [Skip] ${targetDate} : 주말입니다.`);
+                    continue; 
+                }
+
+                // -------------------------------------------------------------------
+                // [Optimization] 2단계: 대표 '지수'를 통한 휴장일 체크
+                // 미국: S&P 500 (^GSPC), 한국: 코스피 (^KS11) 기준
+                // -------------------------------------------------------------------
                 const targetYear = parseInt(targetDate.split('-')[0]);
+                const benchmarkTicker = (country === 'KR') ? '^KS11' : '^GSPC';
+                
+                try {
+                    const bmRef = firestore.collection('stocks').doc(benchmarkTicker)
+                                           .collection('annual_data').doc(String(targetYear));
+                    const bmSnap = await bmRef.get();
+
+                    if (bmSnap.exists) {
+                        const bmData = bmSnap.data().data || [];
+                        const isMarketOpen = bmData.some(d => d.date === targetDate);
+                        
+                        if (!isMarketOpen) {
+                            console.log(`⏭️ [Skip] ${targetDate} : 휴장일입니다. (${benchmarkTicker} 데이터 없음)`);
+                            continue;
+                        }
+                    } else {
+                        console.warn(`⚠️ [Check] ${targetYear}년도 지수(${benchmarkTicker}) 데이터가 없습니다. 휴장일 체크를 건너뛰고 진행합니다.`);
+                    }
+                } catch (bmError) {
+                    console.warn(`⚠️ [Check] 휴장일 확인 중 에러 발생: ${bmError.message}`);
+                }
+                
+                // -------------------------------------------------------------------
+                // 실제 통계 계산 로직
+                // -------------------------------------------------------------------
                 const requiredYears = [String(targetYear), String(targetYear - 1), String(targetYear - 2)];
                 const docId = `${targetDate}_${country || 'US'}`;
                 const docRef = firestore.collection('meta_ticker_stats').doc(docId);
                 
                 let successCount = 0;
                 let chunkIndex = 0;
-                const WRITE_CHUNK_SIZE = 100; // 파이어스토어에 저장할 종목 단위
+                const WRITE_CHUNK_SIZE = 100;
 
-                // ⚡ [핵심] 500개 단위로 Chunk 나누기
                 for (let i = 0; i < tickers.length; i += WRITE_CHUNK_SIZE) {
                     const chunkTickers = tickers.slice(i, i + WRITE_CHUNK_SIZE);
                     const batchData = {}; 
 
-                    // 4. 메모리 폭주를 막기 위해 500개 안에서 다시 100개씩 순차/병렬 처리
                     for (let j = 0; j < chunkTickers.length; j += 100) {
                         const subTickers = chunkTickers.slice(j, j + 100);
                         
@@ -138,77 +169,117 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                                 yearDocs.forEach(doc => {
                                     if (doc.exists) {
                                         const dataList = doc.data().data || []; 
-                                        if (Array.isArray(dataList)) {
-                                            combinedHistory = combinedHistory.concat(dataList);
-                                        }
+                                        if (Array.isArray(dataList)) combinedHistory = combinedHistory.concat(dataList);
                                     }
                                 });
 
                                 combinedHistory.sort((a, b) => new Date(b.date) - new Date(a.date));
-
                                 if (combinedHistory.length === 0) return;
 
                                 const idx = combinedHistory.findIndex(h => h.date === targetDate);
                                 if (idx === -1) return;
 
-                                const todayClose = combinedHistory[idx].close;
+                                const dayData = combinedHistory[idx];
+                                const todayClose = dayData.close;
+                                const todayVolume = dayData.volume || 0;
                                 
-                                const masterInfo = stockMasterInfo[ticker] || { industry: '', estimatedShares: 0 };
-                                const calculatedMktCap = Math.round(masterInfo.estimatedShares * todayClose);
+                                const mktCap = dayData.mktCap || 0;
+                                const volumeAmt = Math.round(todayClose * todayVolume);
+                                
+                                const masterInfo = stockMasterInfo[ticker] || { industry: '' };
                                 const myThemes = themeMap[ticker] || [];
 
                                 const stats = {
-                                    marketCap: calculatedMktCap,
+                                    close: todayClose,
+                                    mktCap: mktCap,
+                                    volume_amt: volumeAmt,
                                     industry: masterInfo.industry,
-                                    themes: myThemes, // 🚀 테마 1~5 대신 배열 통째로 삽입!
+                                    themes: myThemes,
                                     perf_vs_prev: {},
                                     perf_vs_low: {},
-                                    perf_vs_high: {}
+                                    perf_vs_high: {},
+                                    sma: {}, 
+                                    avg_volume_amt_20d: 0,
+                                    low_240d: 0,
+                                    high_240d: 0
+                                };
+
+                                const calculateReturn = (current, past) => {
+                                    if (!past || past === 0 || !current) return 0;
+                                    const res = ((current - past) / past) * 100;
+                                    return isFinite(res) ? parseFloat(res.toFixed(2)) : 0;
                                 };
 
                                 [1, 2, 3, 4, 5, 10, 20, 40, 60, 120, 240, 480].forEach(d => {
-                                    if (combinedHistory[idx + d]) {
-                                        const pastClose = combinedHistory[idx + d].close;
-                                        stats.perf_vs_prev[`${d}d`] = parseFloat((((todayClose - pastClose) / pastClose) * 100).toFixed(2));
-                                    }
+                                    const pastData = combinedHistory[idx + d];
+                                    const pastClose = pastData ? pastData.close : 0;
+                                    stats.perf_vs_prev[`${d}d`] = calculateReturn(todayClose, pastClose);
                                 });
 
                                 [5, 10, 20, 40, 60, 120, 240, 480].forEach(d => {
                                     if (combinedHistory.length > idx + d) {
                                         const slice = combinedHistory.slice(idx, idx + d);
-                                        const minLow = Math.min(...slice.map(h => h.low));
-                                        const maxHigh = Math.max(...slice.map(h => h.high));
+                                        const lows = slice.map(h => h.low).filter(v => v > 0);
+                                        const highs = slice.map(h => h.high).filter(v => v > 0);
+
+                                        const minLow = lows.length > 0 ? Math.min(...lows) : 0;
+                                        const maxHigh = highs.length > 0 ? Math.max(...highs) : 0;
+
+                                        stats.perf_vs_low[`${d}d`] = calculateReturn(todayClose, minLow);
+                                        stats.perf_vs_high[`${d}d`] = calculateReturn(todayClose, maxHigh);
                                         
-                                        stats.perf_vs_low[`${d}d`] = parseFloat((((todayClose - minLow) / minLow) * 100).toFixed(2));
-                                        stats.perf_vs_high[`${d}d`] = parseFloat((((todayClose - maxHigh) / maxHigh) * 100).toFixed(2));
+                                        if (d === 240) {
+                                            stats.low_240d = minLow;
+                                            stats.high_240d = maxHigh;
+                                        }
+                                    } else {
+                                        stats.perf_vs_low[`${d}d`] = 0;
+                                        stats.perf_vs_high[`${d}d`] = 0;
                                     }
                                 });
 
+                                [5, 10, 20, 50, 100, 200].forEach(d => {
+                                    if (combinedHistory.length >= idx + d) {
+                                        const slice = combinedHistory.slice(idx, idx + d);
+                                        const validPrices = slice.map(h => h.close).filter(v => v > 0);
+                                        if (validPrices.length === d) {
+                                            const sum = validPrices.reduce((acc, curr) => acc + curr, 0);
+                                            stats.sma[`${d}d`] = parseFloat((sum / d).toFixed(2));
+                                        } else {
+                                            stats.sma[`${d}d`] = 0;
+                                        }
+                                    } else {
+                                        stats.sma[`${d}d`] = 0;
+                                    }
+                                });
+
+                                const volAvgDays = 20;
+                                if (combinedHistory.length >= idx + volAvgDays) {
+                                    const volSlice = combinedHistory.slice(idx, idx + volAvgDays);
+                                    const volSum = volSlice.reduce((acc, curr) => {
+                                        return acc + ((curr.close || 0) * (curr.volume || 0));
+                                    }, 0);
+                                    stats.avg_volume_amt_20d = Math.round(volSum / volAvgDays);
+                                }
+
                                 batchData[ticker] = stats;
                                 successCount++;
-
                             } catch (e) {
                                 console.error(`❌ ${ticker} 집계 에러:`, e.message);
                             }
                         }));
                     }
 
-                    // ⚡ 서브 컬렉션(chunks)에 batch_0, batch_1 포맷으로 저장
                     if (Object.keys(batchData).length > 0) {
                         try {
-                            // 2. 개별 청크 저장 시 에러가 나도 프로세스가 죽지 않게 try-catch 사용
                             await docRef.collection('chunks').doc(`batch_${chunkIndex}`).set(batchData);
-                            console.log(`📦 [Batch] batch_${chunkIndex} 저장 완료 (${Object.keys(batchData).length}종목)`);
                             chunkIndex++;
                         } catch (saveError) {
-                            // 3. 에러 발생 시 로그만 찍고 다음으로 넘어가도록 처리
-                            console.error(`❌ [Batch Error] batch_${chunkIndex} 저장 중 에러 발생:`, saveError.message);
-                            // 필요하다면 여기서 알림을 보내거나 기록
+                            console.error(`❌ [Batch Error] 저장 실패:`, saveError.message);
                         }
                     }
                 }
                 
-                // ⚡ 부모 문서에 메타 데이터 업데이트
                 await docRef.set({
                     date: targetDate,
                     country: country || 'US',
@@ -218,7 +289,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                     updatedAt: new Date().toISOString()
                 }, { merge: true });
 
-                console.log(`✅ [Batch] ${docId} 통계 완료 (총 ${successCount}건, ${chunkIndex}개 Chunk로 분할 저장됨)`);
+                console.log(`✅ [Batch] ${docId} 통계 완료 (총 ${successCount}개 종목)`);
             }
             console.log(`🏁 [Batch] 전체 작업 완료`);
         });

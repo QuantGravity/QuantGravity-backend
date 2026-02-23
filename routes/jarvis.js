@@ -15,7 +15,7 @@ const fs = require('fs');
 const { askJarvis } = require('../utils/jarvisClient'); 
 const admin = require('firebase-admin'); 
 const db = admin.firestore();            
-const { verifyToken } = require('../utils/authHelper');
+const { verifyToken, verifyBatchOrAdmin } = require('../utils/authHelper');
 const axios = require('axios');
 
 // ---------------------------------------------------------------------------
@@ -202,7 +202,18 @@ router.post('/research-new-themes', async (req, res) => {
         });
 
         await batch.commit();
-        console.log(`✅ [자비스] ${themes.length}개 테마 저장 완료`);
+
+        // 🌟 [추가] 테마 마스터 메타 상태 업데이트
+        const now = new Date().toISOString();
+        await db.collection('meta_stats').doc('meta_sync_status').set({
+            theme_master: {
+                lastUpdated: now,
+                version: Date.now(),
+                themeCount: themes.length // 이번에 추가된 개수
+            }
+        }, { merge: true });
+
+        console.log(`✅ [자비스] ${themes.length}개 테마 저장 및 메타 상태 업데이트 완료`);
         res.json({ success: true, count: themes.length });
 
     } catch (error) {
@@ -231,6 +242,14 @@ router.post('/update-theme-tickers', async (req, res) => {
             ticker_count: tickers.length,
             updated_at: new Date().toISOString()
         });
+
+        // 🌟 [추가] 테마 마스터 메타 상태 업데이트
+        await db.collection('meta_stats').doc('meta_sync_status').set({
+            theme_master: {
+                lastUpdated: new Date().toISOString(),
+                version: Date.now()
+            }
+        }, { merge: true });
 
         res.json({ success: true, count: tickers.length });
     } catch (error) {

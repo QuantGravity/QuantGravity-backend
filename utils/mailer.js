@@ -16,7 +16,7 @@ const express = require('express');
 const router = express.Router();
 const admin = require('firebase-admin');
 const firestore = admin.firestore();
-const { verifyToken, verifyAdmin } = require('../utils/authHelper'); // 보안 강화
+const { verifyToken, verifyBatchOrAdmin } = require('../utils/authHelper');
 const nodemailer = require('nodemailer');
 require('dotenv').config();
 

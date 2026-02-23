@@ -22,6 +22,40 @@ const generateToken = (userProfile) => {
     return jwt.sign(payload, SECRET_KEY, { expiresIn: '6h' });
 };
 
+// 2. [신규] 배치잡 또는 관리자 권한 통합 검증 미들웨어
+const verifyBatchOrAdmin = (req, res, next) => {
+    const batchKey = req.headers['x-batch-key']; // 배치잡용 헤더
+    const authHeader = req.headers['authorization']; // 관리자용 헤더
+    const token = authHeader && authHeader.split(' ')[1];
+
+    // Case A: 배치 키 검증 (가장 우선순위 높음)
+    if (batchKey && batchKey === BATCH_SECRET_KEY) {
+        console.log(`🤖 [Auth] Batch Key 인증 성공 - Path: ${req.originalUrl}`);
+        req.isBatch = true; // 배치 호출임을 표시
+        return next();
+    }
+
+    // Case B: 관리자 토큰 검증 (배치 키가 없을 경우)
+    if (!token) {
+        return res.status(401).json({ error: "인증 정보(Batch Key 또는 Token)가 없습니다." });
+    }
+
+    jwt.verify(token, SECRET_KEY, (err, decodedUser) => {
+        if (err) {
+            return res.status(403).json({ error: "유효하지 않은 인증키입니다." });
+        }
+
+        // 관리자 권한 체크 ('admin' 또는 'G9')
+        if (!['admin', 'G9'].includes(decodedUser.role)) {
+            console.warn(`[Forbidden] 권한 부족 - User: ${decodedUser.email}`);
+            return res.status(403).json({ error: "관리자 권한이 필요합니다." });
+        }
+
+        req.user = decodedUser;
+        next();
+    });
+};
+
 // 2. 로그인 여부 검증 미들웨어
 const verifyToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
@@ -45,15 +79,4 @@ const verifyToken = (req, res, next) => {
     });
 };
 
-// 3. [추가] 관리자 권한 검증 미들웨어
-// verifyToken 뒤에 배치하여 사용자의 계급을 확인합니다.
-const verifyAdmin = (req, res, next) => {
-    // verifyToken을 먼저 통과해야 req.user가 존재함
-    if (!req.user || !['admin', 'G9'].includes(req.user.role)) {
-        console.warn(`[Forbidden Access] 권한 부족 시도 - User: ${req.user?.email}, Role: ${req.user?.role}`);
-        return res.status(403).json({ error: "관리자 권한이 필요한 기능입니다." });
-    }
-    next();
-};
-
-module.exports = { generateToken, verifyToken, verifyAdmin };
+module.exports = { generateToken, verifyToken, verifyBatchOrAdmin };
