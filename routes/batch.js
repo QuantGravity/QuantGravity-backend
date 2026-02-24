@@ -39,7 +39,6 @@ function getTodayByCountry(country) {
 }
 
 // 종목 통계데이터 집계
-// 종목 통계데이터 집계
 router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
     try {
         const { country, startSymbol, endSymbol, startDate, endDate } = req.body;

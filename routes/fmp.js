@@ -680,7 +680,7 @@ router.post('/sync-index-master', verifyBatchOrAdmin, async (req, res) => {
 // [4] 상장폐지 종목 동기화 (Strict Guard)
 router.post('/sync-delisted-master', verifyToken, async (req, res) => {
     try {
-        console.log("🚀 [Delisted] 상장폐지 종목 동기화 (Strict)...");
+        console.log("🚀 [Delisted] 상장폐지 종목 동기화 (Strict)..."); 
         let allDelisted = [];
         let page = 0;
         let hasMoreData = true;

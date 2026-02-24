@@ -38,6 +38,10 @@ jobs:
           -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}" \
           -d '{"days": 3, "market": "US"}' 
 
+      # [추가할 부분] 5분(300초) 대기하여 백그라운드 데이터 저장이 끝날 때까지 기다림
+      - name: Wait for DB Sync
+        run: sleep 300
+
       # 3. 통계 갱신
       - name: Update Market Stats
         run: |
