@@ -1,9 +1,9 @@
 name: KR Market Daily Update
-# 설명: 한국 시장(KOSPI, KOSDAQ) 전용 데일리 업데이트 (매일 한국시간 18:00 실행)
+# 설명: 한국 시장(KOSPI, KOSDAQ) 전용 데일리 업데이트 (매일 한국시간 17:00 실행)
 
 on:
   schedule:
-    - cron: '0 9 * * *' # UTC 09:00 = KST 18:00
+    - cron: '0 8 * * *' # UTC 08:00 = KST 17:00
   workflow_dispatch:
 
 jobs:
