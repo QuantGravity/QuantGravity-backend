@@ -2,51 +2,51 @@ name: US Market Daily Update
 # 설명: 미국 시장 전용 (매일 한국시간 아침 7시 10분 실행)
 
 on:
-  schedule:
-    - cron: '10 22 * * *' # UTC 22:10 = KST 07:10
-  workflow_dispatch:
+  schedule:
+    - cron: '10 22 * * *' # UTC 22:10 = KST 07:10
+  workflow_dispatch:
 
 jobs:
-  us-daily-routine:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Wake up Server
-        run: curl https://quantgravity-backend.onrender.com/ 
+  us-daily-routine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake up Server
+        run: curl https://quantgravity-backend.onrender.com/ 
 
-      # 1. 마스터 동기화 (종목 -> 인덱스 순서)
-      - name: Sync Ticker Master
-        run: |
-          echo "📇 [US] 종목 마스터 동기화 시작..."
-          curl -X POST https://quantgravity-backend.onrender.com/api/fmp/sync-ticker-master \
-          -H "Content-Type: application/json" \
-          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}"
+      # 1. 마스터 동기화 (종목 -> 인덱스 순서)
+      - name: Sync Ticker Master
+        run: |
+          echo "📇 [US] 종목 마스터 동기화 시작..."
+          curl -X POST https://quantgravity-backend.onrender.com/api/fmp/sync-ticker-master \
+          -H "Content-Type: application/json" \
+          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}"
 
-      - name: Sync Index Master
-        run: |
-          echo "📈 [US] 인덱스 마스터 동기화 시작..."
-          curl -X POST https://quantgravity-backend.onrender.com/api/fmp/sync-index-master \
-          -H "Content-Type: application/json" \
-          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}"
+      - name: Sync Index Master
+        run: |
+          echo "📈 [US] 인덱스 마스터 동기화 시작..."
+          curl -X POST https://quantgravity-backend.onrender.com/api/fmp/sync-index-master \
+          -H "Content-Type: application/json" \
+          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}"
 
-      # 2. 미국 주가 업데이트
-      - name: US Stock Price Update
-        timeout-minutes: 15
-        run: |
-          echo "🚀 [US] 미국 시장 주가 업데이트 시작..."
-          curl -X POST https://quantgravity-backend.onrender.com/api/fmp/daily-update-all \
-          -H "Content-Type: application/json" \
-          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}" \
-          -d '{"days": 3, "market": "US"}' 
+      # 2. 미국 주가 업데이트
+      - name: US Stock Price Update
+        timeout-minutes: 15
+        run: |
+          echo "🚀 [US] 미국 시장 주가 업데이트 시작..."
+          curl -X POST https://quantgravity-backend.onrender.com/api/fmp/daily-update-all \
+          -H "Content-Type: application/json" \
+          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}" \
+          -d '{"days": 3, "market": "US"}' 
 
-      # [추가할 부분] 5분(300초) 대기하여 백그라운드 데이터 저장이 끝날 때까지 기다림
-      - name: Wait for DB Sync
-        run: sleep 300
+      # [추가할 부분] 5분(300초) 대기하여 백그라운드 데이터 저장이 끝날 때까지 기다림
+      - name: Wait for DB Sync
+        run: sleep 300
 
-      # 3. 통계 갱신
-      - name: Update Market Stats
-        run: |
-          echo "📊 [US] 미국 시장 통계 집계 시작..."
-          curl -X POST https://quantgravity-backend.onrender.com/api/batch/update-stats \
-          -H "Content-Type: application/json" \
-          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}" \
-          -d '{"country": "US"}'
+      # 3. 통계 갱신
+      - name: Update Market Stats
+        run: |
+          echo "📊 [US] 미국 시장 통계 집계 시작..."
+          curl -X POST https://quantgravity-backend.onrender.com/api/batch/update-stats \
+          -H "Content-Type: application/json" \
+          -H "x-batch-key: ${{ secrets.BATCH_SECRET_KEY }}" \
+          -d '{"country": "US"}'
