@@ -25,7 +25,7 @@ router.post('/mass-parallel-analyze-tickers', verifyToken, async (req, res) => {
     const rp1 = parseInt(rollingPeriod1) || 10;
     const rp2 = parseInt(rollingPeriod2) || 5;
 
-    if (!tickers || !Array.isArray(tickers) || tickers.length === 0) return res.json([]);
+    if (!tickers || !Array.isArray(tickers) || tickers.length === 0) return res.json([]); 
 
     try {
         // [1] 등급별 부하 조절 설정 (전략 시뮬레이션과 동일 기준 적용)

@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Wake up Server
-        run: curl https://quantgravity-backend.onrender.com/
+        run: curl https://quantgravity-backend.onrender.com/ 
 
       # 1. 마스터 동기화 (종목 -> 인덱스 순서)
       - name: Sync Ticker Master

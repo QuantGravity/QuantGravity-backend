@@ -20,7 +20,7 @@ async function analyzeTickerPerformance(ticker, startDate, endDate, rp1, rp2) {
             price: parseFloat(r.close_price)
         }));
     } catch (e) {
-        console.error(`데이터 조회 실패 (${ticker}):`, e);
+        console.error(`데이터 조회 실패 (${ticker}):`, e); 
         return { ticker, error: "데이터 조회 오류" };
     }
 
