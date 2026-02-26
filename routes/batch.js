@@ -39,6 +39,7 @@ function getTodayByCountry(country) {
 }
 
 // 종목 통계데이터 집계
+// 종목 통계데이터 집계
 router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
     try {
         const { country, startSymbol, endSymbol, startDate, endDate } = req.body;
@@ -57,7 +58,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
             const snapshot = await query.select().get();
             tickers = snapshot.docs.map(doc => doc.id);
             
-            // 🌟 [수정 포인트] 지수(Index)는 country 필드가 누락되어 있을 수 있으므로 수동으로 강제 포함
+            // 🌟 지수(Index)는 country 필드가 누락되어 있을 수 있으므로 수동으로 강제 포함
             const coreIndices = country === 'KR' 
                 ? ['^KS11', '^KQ11', '^KS200', '^KRX100'] 
                 : ['^GSPC', '^IXIC', '^NDX', '^DJI', '^RUT', '^VIX', '^W5000']; // 기본값 US
@@ -81,7 +82,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
         setImmediate(async () => {
             console.log(`🚀 [Batch] 통계 업데이트 시작 (국가: ${country || 'US'}, 기간: ${targetDates[0]}~${targetDates[targetDates.length-1]})`);
             
-            // 2. 데이터 준비 (테마, 산업 정보 등)
+            // 2. 데이터 준비 (테마, 산업/섹터 정보 등)
             const themeMap = {};
             const themesSnap = await firestore.collection('market_themes').get();
             themesSnap.forEach(doc => {
@@ -98,14 +99,17 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
             const stocksSnap = await firestore.collection('stocks').where('active', '==', true).get();
             stocksSnap.forEach(doc => {
                 const data = doc.data();
-                stockMasterInfo[doc.id] = { industry: data.industry || '' };
+                stockMasterInfo[doc.id] = { 
+                    industry: data.industry || '',
+                    sector: data.sector || '',
+                    isEtf: data.isEtf === true
+                };
             });
+
+            const periods = [5, 10, 20, 40, 60, 120, 240, 480, 'all'];
 
             // 3. 날짜별 루프
             for (const targetDate of targetDates) {
-                // -------------------------------------------------------------------
-                // [Optimization] 1단계: 주말 체크 (토=6, 일=0)
-                // -------------------------------------------------------------------
                 const dayOfWeek = new Date(targetDate).getDay(); 
                 if (dayOfWeek === 0 || dayOfWeek === 6) {
                     console.log(`⏭️ [Skip] ${targetDate} : 주말입니다.`);
@@ -113,8 +117,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                 }
 
                 // -------------------------------------------------------------------
-                // [Optimization] 2단계: 대표 '지수'를 통한 휴장일 체크
-                // 미국: S&P 500 (^GSPC), 한국: 코스피 (^KS11) 기준
+                // [Optimization] 대표 '지수'를 통한 휴장일 체크
                 // -------------------------------------------------------------------
                 const targetYear = parseInt(targetDate.split('-')[0]);
                 const benchmarkTicker = (country === 'KR') ? '^KS11' : '^GSPC';
@@ -139,9 +142,6 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                     console.warn(`⚠️ [Check] 휴장일 확인 중 에러 발생: ${bmError.message}`);
                 }
                 
-                // -------------------------------------------------------------------
-                // 실제 통계 계산 로직
-                // -------------------------------------------------------------------
                 const requiredYears = [String(targetYear), String(targetYear - 1), String(targetYear - 2)];
                 const docId = `${targetDate}_${country || 'US'}`;
                 const docRef = firestore.collection('meta_ticker_stats').doc(docId);
@@ -149,6 +149,9 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                 let successCount = 0;
                 let chunkIndex = 0;
                 const WRITE_CHUNK_SIZE = 100;
+
+                // 그룹(국가/섹터/산업)별 누적을 위한 객체
+                const groupDailyAgg = {}; 
 
                 for (let i = 0; i < tickers.length; i += WRITE_CHUNK_SIZE) {
                     const chunkTickers = tickers.slice(i, i + WRITE_CHUNK_SIZE);
@@ -185,22 +188,15 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                                 const mktCap = dayData.mktCap || 0;
                                 const volumeAmt = Math.round(todayClose * todayVolume);
                                 
-                                const masterInfo = stockMasterInfo[ticker] || { industry: '' };
+                                const masterInfo = stockMasterInfo[ticker] || { industry: '', sector: '', isEtf: false };
                                 const myThemes = themeMap[ticker] || [];
 
                                 const stats = {
-                                    close: todayClose,
-                                    mktCap: mktCap,
-                                    volume_amt: volumeAmt,
-                                    industry: masterInfo.industry,
-                                    themes: myThemes,
-                                    perf_vs_prev: {},
-                                    perf_vs_low: {},
-                                    perf_vs_high: {},
-                                    sma: {}, 
-                                    avg_volume_amt_20d: 0,
-                                    low_240d: 0,
-                                    high_240d: 0
+                                    close: todayClose, mktCap: mktCap, volume_amt: volumeAmt,
+                                    industry: masterInfo.industry, themes: myThemes,
+                                    perf_vs_prev: {}, perf_vs_low: {}, perf_vs_high: {},
+                                    prev_low: {}, prev_high: {}, is_new_low: {}, is_new_high: {}, 
+                                    sma: {}, avg_volume_amt_20d: 0, low_240d: 0, high_240d: 0
                                 };
 
                                 const calculateReturn = (current, past) => {
@@ -215,25 +211,34 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                                     stats.perf_vs_prev[`${d}d`] = calculateReturn(todayClose, pastClose);
                                 });
 
-                                [5, 10, 20, 40, 60, 120, 240, 480].forEach(d => {
-                                    if (combinedHistory.length > idx + d) {
-                                        const slice = combinedHistory.slice(idx, idx + d);
-                                        const lows = slice.map(h => h.low).filter(v => v > 0);
-                                        const highs = slice.map(h => h.high).filter(v => v > 0);
+                                periods.forEach(d => {
+                                    const key = d === 'all' ? 'all' : `${d}d`;
+                                    let sliceStart = idx + 1;
+                                    let sliceEnd = d === 'all' ? combinedHistory.length : idx + 1 + d;
 
-                                        const minLow = lows.length > 0 ? Math.min(...lows) : 0;
-                                        const maxHigh = highs.length > 0 ? Math.max(...highs) : 0;
+                                    if (combinedHistory.length > sliceStart) {
+                                        const slice = combinedHistory.slice(sliceStart, sliceEnd);
+                                        const validPrices = slice.map(h => h.close).filter(v => v > 0);
 
-                                        stats.perf_vs_low[`${d}d`] = calculateReturn(todayClose, minLow);
-                                        stats.perf_vs_high[`${d}d`] = calculateReturn(todayClose, maxHigh);
+                                        const prevLow = validPrices.length > 0 ? Math.min(...validPrices) : 0;
+                                        const prevHigh = validPrices.length > 0 ? Math.max(...validPrices) : 0;
+
+                                        stats.prev_low[key] = prevLow;
+                                        stats.prev_high[key] = prevHigh;
+                                        stats.perf_vs_low[key] = calculateReturn(todayClose, prevLow);
+                                        stats.perf_vs_high[key] = calculateReturn(todayClose, prevHigh);
+
+                                        stats.is_new_low[key] = prevLow > 0 && todayClose < prevLow;
+                                        stats.is_new_high[key] = prevHigh > 0 && todayClose > prevHigh;
                                         
                                         if (d === 240) {
-                                            stats.low_240d = minLow;
-                                            stats.high_240d = maxHigh;
+                                            stats.low_240d = prevLow;
+                                            stats.high_240d = prevHigh;
                                         }
                                     } else {
-                                        stats.perf_vs_low[`${d}d`] = 0;
-                                        stats.perf_vs_high[`${d}d`] = 0;
+                                        stats.prev_low[key] = 0; stats.prev_high[key] = 0;
+                                        stats.perf_vs_low[key] = 0; stats.perf_vs_high[key] = 0;
+                                        stats.is_new_low[key] = false; stats.is_new_high[key] = false;
                                     }
                                 });
 
@@ -255,14 +260,61 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                                 const volAvgDays = 20;
                                 if (combinedHistory.length >= idx + volAvgDays) {
                                     const volSlice = combinedHistory.slice(idx, idx + volAvgDays);
-                                    const volSum = volSlice.reduce((acc, curr) => {
-                                        return acc + ((curr.close || 0) * (curr.volume || 0));
-                                    }, 0);
+                                    const volSum = volSlice.reduce((acc, curr) => acc + ((curr.close || 0) * (curr.volume || 0)), 0);
                                     stats.avg_volume_amt_20d = Math.round(volSum / volAvgDays);
                                 }
 
                                 batchData[ticker] = stats;
                                 successCount++;
+
+                                // ---------------------------------------------------------------
+                                // 🌟 [핵심 수정] 그룹 집계 데이터 누적 시 꼬리표(meta) 명확하게 붙이기
+                                // ---------------------------------------------------------------
+                                const isEtf = masterInfo.isEtf;
+                                const isIndex = ticker.startsWith('^');
+
+                                if (!isEtf && !isIndex) {
+                                    const ctry = country || 'US';
+                                    const sec = masterInfo.sector;
+                                    const ind = masterInfo.industry;
+
+                                    // 배열에 타입과 이름 메타데이터를 직접 객체로 담아서 전달
+                                    const groupsToUpdate = [];
+                                    
+                                    // 1. 국가 전체 데이터 꼬리표
+                                    groupsToUpdate.push({ key: ctry, type: 'COUNTRY', name: ctry, parentSectorKey: null });
+                                    
+                                    // 2. 섹터 전체 데이터 꼬리표
+                                    if (sec) {
+                                        groupsToUpdate.push({ key: `${ctry}_${sec}`, type: 'SECTOR', name: sec, parentSectorKey: `${ctry}_${sec}` });
+                                    }
+                                    
+                                    // 3. 산업 데이터 꼬리표 (부모 섹터 키를 같이 넘겨줌)
+                                    if (sec && ind) {
+                                        groupsToUpdate.push({ key: `${ctry}_${ind}`, type: 'INDUSTRY', name: ind, parentSectorKey: `${ctry}_${sec}` });
+                                    }
+
+                                    groupsToUpdate.forEach(meta => {
+                                        const gKey = meta.key;
+                                        if (!groupDailyAgg[gKey]) {
+                                            // 초기화 할 때 meta 정보를 객체 안에 저장해둠
+                                            groupDailyAgg[gKey] = { total: 0, new_high: {}, new_low: {}, meta: meta };
+                                            periods.forEach(p => {
+                                                const pKey = p === 'all' ? 'all' : `${p}d`;
+                                                groupDailyAgg[gKey].new_high[pKey] = 0;
+                                                groupDailyAgg[gKey].new_low[pKey] = 0;
+                                            });
+                                        }
+                                        
+                                        groupDailyAgg[gKey].total++;
+                                        periods.forEach(p => {
+                                            const pKey = p === 'all' ? 'all' : `${p}d`;
+                                            if (stats.is_new_high[pKey]) groupDailyAgg[gKey].new_high[pKey]++;
+                                            if (stats.is_new_low[pKey]) groupDailyAgg[gKey].new_low[pKey]++;
+                                        });
+                                    });
+                                }
+
                             } catch (e) {
                                 console.error(`❌ ${ticker} 집계 에러:`, e.message);
                             }
@@ -274,7 +326,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                             await docRef.collection('chunks').doc(`batch_${chunkIndex}`).set(batchData);
                             chunkIndex++;
                         } catch (saveError) {
-                            console.error(`❌ [Batch Error] 저장 실패:`, saveError.message);
+                            console.error(`❌ [Batch Error] 개별 종목 저장 실패:`, saveError.message);
                         }
                     }
                 }
@@ -287,6 +339,78 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                     totalCount: successCount,
                     updatedAt: new Date().toISOString()
                 }, { merge: true });
+
+                // -------------------------------------------------------------------
+                // 🌟 [핵심 수정] 저장해 둔 꼬리표(meta)를 읽어서 섹터별-년도별로 묶기
+                // -------------------------------------------------------------------
+
+                if (Object.keys(groupDailyAgg).length > 0) {
+                    
+                    const sectorBundles = {};
+                    const countryTotalBundle = {}; 
+
+                    for (const [groupKey, groupData] of Object.entries(groupDailyAgg)) {
+                        
+                        const rates = {
+                            totalCount: groupData.total,
+                            new_high_rate: {},
+                            new_low_rate: {}
+                        };
+                        periods.forEach(p => {
+                            const pKey = p === 'all' ? 'all' : `${p}d`;
+                            rates.new_high_rate[pKey] = groupData.total > 0 ? parseFloat(((groupData.new_high[pKey] / groupData.total) * 100).toFixed(2)) : 0;
+                            rates.new_low_rate[pKey] = groupData.total > 0 ? parseFloat(((groupData.new_low[pKey] / groupData.total) * 100).toFixed(2)) : 0;
+                        });
+                        
+                        // 집계 로직에서 심어둔 꼬리표 꺼내기
+                        const meta = groupData.meta;
+                        const parentKey = meta.parentSectorKey; // 예: "US_Technology"
+                        const myName = meta.name;               // 예: "Semiconductors"
+
+                        if (meta.type === 'INDUSTRY') {
+                            if (!sectorBundles[parentKey]) sectorBundles[parentKey] = {};
+                            if (!sectorBundles[parentKey][myName]) sectorBundles[parentKey][myName] = {};
+                            sectorBundles[parentKey][myName][targetDate] = rates;
+
+                        } else if (meta.type === 'SECTOR') {
+                            if (!sectorBundles[parentKey]) sectorBundles[parentKey] = {};
+                            if (!sectorBundles[parentKey]['_SECTOR_TOTAL_']) sectorBundles[parentKey]['_SECTOR_TOTAL_'] = {};
+                            sectorBundles[parentKey]['_SECTOR_TOTAL_'][targetDate] = rates;
+                            
+                        } else if (meta.type === 'COUNTRY') {
+                            countryTotalBundle[targetDate] = rates;
+                        }
+                    }
+
+                    // 2. 파이어스토어 저장 (Merge 옵션 필수)
+                    const batch = firestore.batch();
+
+                    // (A) 섹터별 문서 저장 (ID: US_Technology_2026)
+                    for (const [sectorKey, industriesData] of Object.entries(sectorBundles)) {
+                        const docId = `${sectorKey}_${targetYear}`; 
+                        const docRef = firestore.collection('meta_sector_stats').doc(docId);
+                        
+                        const payload = {
+                            country: country || 'US',
+                            year: String(targetYear),
+                            updatedAt: new Date().toISOString(),
+                            industries: industriesData 
+                        };
+                        
+                        batch.set(docRef, payload, { merge: true });
+                    }
+
+                    // (B) 국가 전체 문서 저장 (ID: US_Total_2026)
+                    const countryDocRef = firestore.collection('meta_sector_stats').doc(`${country || 'US'}_Total_${targetYear}`);
+                    batch.set(countryDocRef, {
+                        country: country || 'US',
+                        year: String(targetYear),
+                        updatedAt: new Date().toISOString(),
+                        data: countryTotalBundle
+                    }, { merge: true });
+
+                    await batch.commit();
+                }
 
                 console.log(`✅ [Batch] ${docId} 통계 완료 (총 ${successCount}개 종목)`);
             }

@@ -40,10 +40,12 @@ const COLLECTION_RULES = {
     // 종목별 통계 데이터 (종목 Map 등에서 사용)
     // 날짜별/국가별 통계 정보이므로 관리자만 배치 작업으로 업데이트함
     'meta_ticker_stats': (user, docId, data) => ['admin'].includes(user.role),
+    'meta_group_stats': (user, docId, data) => ['admin', 'G9'].includes(user.role),
     
     // 통계 데이터의 하위 chunk 컬렉션 접근을 위해 추가
     // (URL 인코딩된 경로로 들어올 경우를 대비해 규칙에 포함)
     'meta_ticker_stats_chunks': (user, docId, data) => ['admin'].includes(user.role),
+    'meta_group_stats_chunk': (user, docId, data) => ['admin', 'G9'].includes(user.role),
 
     // [추가] 일반 통계 및 시장 지표 데이터
     // 사용자는 '조회'만 가능해야 하므로, API를 통한 '쓰기'는 관리자만 허용

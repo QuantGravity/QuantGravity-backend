@@ -170,7 +170,7 @@ router.post('/mass-parallel-simulate-strategies', verifyToken, logTraffic, async
                     }
                     return resultObj;
                 } else {
-                    return { strategy_code: strat.strategy_code, success: false, message: "시뮬레이션 실패" };
+                    return { strategy_code: strat.strategy_code, success: false, message: "시뮬레이션 실패" }; 
                 }
             });
 

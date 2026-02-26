@@ -404,11 +404,16 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
         let tempCash = startCash;
         let tempShares = prevShares;
 
+        // [보고서용 변수 추가] 해당 일자의 매수/매도 시작가 기록용
+        let reportBuyStartPrice = 0;
+        let reportSellStartPrice = 0;
+
         // ----------------------------------------------------------------
         // 1. 매수 계산 (Buy Calculation) - NPER Logic 적용
         // ----------------------------------------------------------------
         if (prevShares > 0) {
             let buyStartPrice = (prevLower * (1 - p_gapBuyPct)) / prevShares;
+            reportBuyStartPrice = buyStartPrice; // [데이터 저장용 값 할당]
             
             // [NPER 계산] 매수 가능 최대 횟수 계산 (Low 도달 기준)
             let maxBuyLoops = 0;
@@ -477,6 +482,7 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
         // ----------------------------------------------------------------
         if (prevShares > 0) {
             let sellStartPrice = (prevUpper * (1 + p_gapSellPct)) / prevShares;
+            reportSellStartPrice = sellStartPrice; // [데이터 저장용 값 할당]
 
             // [NPER 계산] 매도 가능 최대 횟수 계산 (High 도달 기준)
             let maxSellLoops = 0;
@@ -629,6 +635,10 @@ async function simulateStrategyPerformance(params, preLoadedPriceData = null) {
                 failCount: dailyFailCount,
                 
                 open, high, low, close,
+                // [요청 반영] 일자별 매수/매도 시작가 추가
+                buyStart: reportBuyStartPrice,
+                sellStart: reportSellStartPrice,
+
                 startCash, 
                 sAmt: dailySellAmt, 
                 bAmt: dailyBuyAmt,  
