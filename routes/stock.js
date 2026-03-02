@@ -20,28 +20,20 @@ const { getTickerData, getDailyStockData } = require('../utils/stockHelper');
 // ============================================================
 router.get('/symbol-lookup', verifyToken, async (req, res) => {
     try {
-        // 1. 프론트엔드에서 보낸 파라미터 수신
-        const { symbol, exchange, country, justList } = req.query;
+        // 🌟 [수정] includeDelisted 쿼리 파라미터 수신
+        const { symbol, exchange, country, justList, includeDelisted } = req.query;
 
-        // 2. 헬퍼 함수 호출 시 country 파라미터가 누락되지 않도록 주의!
         const results = await getTickerData({
             symbol,
             exchange,
-            country, // 🛑 [핵심 수정] 이 부분이 빠져 있었어! 꼭 넣어줘야 해.
-            justList: justList === 'true'
+            country,
+            justList: justList === 'true',
+            includeDelisted: includeDelisted === 'true' // 🌟 헬퍼로 전달
         });
 
-        if (symbol && !results) {
-            return res.json({ success: false, message: "Symbol not found" });
-        }
-
-        res.json({ 
-            success: true, 
-            count: Array.isArray(results) ? results.length : 1,
-            [symbol ? 'data' : 'symbols']: results 
-        });
+        if (symbol && !results) return res.json({ success: false, message: "Symbol not found" });
+        res.json({ success: true, count: Array.isArray(results) ? results.length : 1, [symbol ? 'data' : 'symbols']: results });
     } catch (error) {
-        console.error("Symbol Lookup Error:", error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -49,47 +41,40 @@ router.get('/symbol-lookup', verifyToken, async (req, res) => {
 // =============================================================
 // [기능 2] 티커 검색 (New: meta_tickers 기반 + ETF 관리 지원)
 // =============================================================
-// [기능 2] 티커 검색 및 전체 로드 (로컬 필터링 지원용)
 router.post('/ticker-search', verifyToken, async (req, res) => {
     try {
-        const { type, keyword, userGrade } = req.body;
+        // 🌟 [수정] includeDelisted 바디 파라미터 수신
+        const { type, keyword, userGrade, includeDelisted } = req.body;
         
         const tokenRole = req.user ? req.user.role : null;
         const isAdmin = ['admin', 'G9'].includes(tokenRole);
         const isFreeUser = !isAdmin && (!userGrade || userGrade === 'FREE');
 
-        // 전체 리스트 확보 (getTickerData는 이미 정렬 및 기본 정규화가 되어 있다고 가정)
-        let allTickers = await getTickerData();
+        // 🌟 헬퍼로 전달
+        let allTickers = await getTickerData({ includeDelisted: includeDelisted === true });
 
-        // [보안] 무료 유저인 경우 지수(^)가 아닌 데이터는 필터링하여 보안 유지
         if (isFreeUser) {
             allTickers = allTickers.filter(item => (item.id || "").startsWith('^'));
         }
 
-        // 클라이언트에서 'ALL'을 요청하면 필터링 없이 전체 반환 (로컬 캐싱용)
-        if (type === 'ALL') {
-            return res.json(allTickers);
-        }
+        if (type === 'ALL') return res.json(allTickers);
 
-        // 기존 하위 호환을 위한 서버 필터링 로직 (필요시 유지)
         const filteredList = allTickers.filter(item => {
             const tCode = item.id.toUpperCase();
             const isIndex = tCode.startsWith('^');
             
-            if (type === '1') return !isIndex; // 지수ETF 등
-            if (type === '8') return isIndex;  // 지수
+            if (type === '1') return !isIndex; 
+            if (type === '8') return isIndex;  
             return true;
         });
 
         res.json(filteredList);
-
     } catch (e) {
-        console.error("Search API Error:", e);
         res.status(500).json({ error: "데이터 로드 중 오류가 발생했습니다." });
     }
 });
 
-// ============================================================
+// ============================================================ 
 // [기능 3] 티커 상세 속성 일괄 조회 (Bulk Attributes)
 // ============================================================
 router.post('/get-attributes-bulk', verifyToken, async (req, res) => {
@@ -110,6 +95,13 @@ router.post('/get-attributes-bulk', verifyToken, async (req, res) => {
         snapshots.forEach(doc => {
             if (doc.exists) {
                 const d = doc.data();
+                
+                // 🌟 [추가] 국가 코드 확인 및 필터링
+                const country = (d.country || '').toUpperCase();
+                if (country && country !== 'US' && country !== 'KR') {
+                    return; // US, KR이 아니면 결과 매핑에서 아예 제외
+                }
+
                 // 필요한 필드만 추출해서 반환
                 resultMap[doc.id] = {
                     leverage: d.leverage_factor || '1',
@@ -177,6 +169,7 @@ router.get('/daily-stock', async (req, res) => {
 
                 const currentHMax = hMax === -Infinity ? 0 : hMax;
 
+                // 🌟 [핵심 수정] 프론트엔드에서 요구하는 4가지 비율 데이터를 모두 정확하게 산출하여 반환
                 return {
                     date: row.date,
                     open_price: row.open_price,
@@ -185,10 +178,15 @@ router.get('/daily-stock', async (req, res) => {
                     close_price: row.close_price,
                     historicMax: currentHMax,
                     dropFromHMax: currentHMax > 0 ? ((close - currentHMax) / currentHMax * 100).toFixed(2) : "0.00",
+                    
                     runningMax: rMax,
-                    minFromRMax: ((low - rMax) / rMax * 100).toFixed(2),
+                    closeFromRMax: rMax > 0 ? ((close - rMax) / rMax * 100).toFixed(2) : "0.00", // 누락되었던 종가 기준 하락율
+                    minFromRMax: rMax > 0 ? ((low - rMax) / rMax * 100).toFixed(2) : "0.00",     // 저가 기준 하락율
+                    
                     runningMin: rMin,
-                    maxFromRMin: ((high - rMin) / rMin * 100).toFixed(2),
+                    closeFromRMin: rMin > 0 ? ((close - rMin) / rMin * 100).toFixed(2) : "0.00", // 누락되었던 종가 기준 상승율
+                    maxFromRMin: rMin > 0 ? ((high - rMin) / rMin * 100).toFixed(2) : "0.00",    // 고가 기준 상승율
+                    
                     renewedHigh, renewedLow, turnToDown, turnToUp,
                     cycleStatus: currentStatus
                 };
@@ -285,7 +283,43 @@ router.get('/meta-sectors', verifyToken, async (req, res) => {
     }
 });
 
-// [stocks.js]
+// ===========================================================================
+// [기능] 일자별 주가 일괄 수집용 타겟 심볼 조회 (상장/상장폐지 상태 필터링 전용)
+// ===========================================================================
+router.get('/batch-target-symbols', verifyBatchOrAdmin, async (req, res) => {
+    try {
+        const { country, status } = req.query;
+        const db = admin.firestore();
+        
+        let query = db.collection('stocks');
+
+        // 국가 조건 필터링
+        if (country) {
+            query = query.where('country', '==', country);
+        }
+
+        // 상장 상태 조건 필터링
+        if (status === 'active') {
+            query = query.where('active', '==', true);
+        } else if (status === 'delisted') {
+            query = query.where('isDelisted', '==', true);
+        }
+
+        // 🌟 파이어스토어 읽기 부하를 최소화하기 위해 문서 ID만 추출(select)
+        const snapshot = await query.select('active', 'isDelisted', 'country').get();
+        const symbols = [];
+        
+        snapshot.forEach(doc => {
+            symbols.push(doc.id);
+        });
+
+        res.json({ success: true, symbols });
+    } catch (error) {
+        console.error("Batch Target Symbols Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // 비활성 종목 리스트 조회 API
 router.get('/inactive-list', verifyBatchOrAdmin, async (req, res) => {
     try {
@@ -298,7 +332,6 @@ router.get('/inactive-list', verifyBatchOrAdmin, async (req, res) => {
         let stockQuery = db.collection('stocks').where('active', '==', false);
 
         // 3. 국가 값이 전달된 경우 국가 조건 추가 필터링
-        // 주의: 파이어스토어 stocks 컬렉션에 국가를 저장하는 필드명이 'country'가 맞는지 확인 필요해!
         if (country) {
             stockQuery = stockQuery.where('country', '==', country);
         }
@@ -307,11 +340,19 @@ router.get('/inactive-list', verifyBatchOrAdmin, async (req, res) => {
 
         const inactiveList = [];
         snapshot.forEach(doc => {
+            const data = doc.data();
+            
+            // 🌟 [추가] 국가 코드 확인 및 이중 필터링
+            const stockCountry = (data.country || '').toUpperCase();
+            if (stockCountry && stockCountry !== 'US' && stockCountry !== 'KR') {
+                return; // US, KR이 아니면 결과 리스트에 담지 않음
+            }
+
             inactiveList.push({
                 id: doc.id,
-                symbol: doc.data().symbol,
-                name_en: doc.data().name_en,
-                name_ko: doc.data().name_ko
+                symbol: data.symbol,
+                name_en: data.name_en,
+                name_ko: data.name_ko
             });
         });
 

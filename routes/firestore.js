@@ -13,7 +13,7 @@ const admin = require('firebase-admin');
 const firestore = admin.firestore();
 const { verifyToken, verifyBatchOrAdmin } = require('../utils/authHelper');
 
-// ============================================================
+// ============================================================ 
 // 각 컬렉션 별로 사용자권한 점검 - 수작업으로 관리해줘야 함.
 // ============================================================
 const COLLECTION_RULES = {
@@ -40,12 +40,12 @@ const COLLECTION_RULES = {
     // 종목별 통계 데이터 (종목 Map 등에서 사용)
     // 날짜별/국가별 통계 정보이므로 관리자만 배치 작업으로 업데이트함
     'meta_ticker_stats': (user, docId, data) => ['admin'].includes(user.role),
-    'meta_group_stats': (user, docId, data) => ['admin', 'G9'].includes(user.role),
+    'meta_sector_stats': (user, docId, data) => ['admin'].includes(user.role), // 🌟 [추가됨] 13번 작업을 위한 권한
     
     // 통계 데이터의 하위 chunk 컬렉션 접근을 위해 추가
     // (URL 인코딩된 경로로 들어올 경우를 대비해 규칙에 포함)
     'meta_ticker_stats_chunks': (user, docId, data) => ['admin'].includes(user.role),
-    'meta_group_stats_chunk': (user, docId, data) => ['admin', 'G9'].includes(user.role),
+    'meta_sector_stats_chunk': (user, docId, data) => ['admin'].includes(user.role),
 
     // [추가] 일반 통계 및 시장 지표 데이터
     // 사용자는 '조회'만 가능해야 하므로, API를 통한 '쓰기'는 관리자만 허용
@@ -397,6 +397,171 @@ router.post('/delete-recursive', verifyBatchOrAdmin, async (req, res) => {
         });
     } catch (error) {
         console.error("Delete Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// [신규 11-1번용] 주가 데이터 연도별 청크 다운로드 API
+// 클라이언트에서 넘긴 종목 배열을 기반으로 stocks/{symbol}/annual_data 를 수집해 반환
+// ============================================================
+router.post('/download-stocks-annual-chunk', verifyToken, async (req, res) => {
+    try {
+        const { symbols, startYear, endYear } = req.body;
+        const user = req.user;
+
+        // 권한 방어
+        if (!['admin', 'G9'].includes(user.role)) {
+            return res.status(403).json({ error: "관리자 전용 기능입니다." });
+        }
+        if (!symbols || !Array.isArray(symbols)) {
+            return res.status(400).json({ error: "요청 심볼 리스트가 필요합니다." });
+        }
+
+        const result = [];
+
+        // 비동기로 Firestore 데이터 연속 조회 (속도 최적화)
+        for (const sym of symbols) {
+            for (let y = parseInt(startYear); y <= parseInt(endYear); y++) {
+                const doc = await firestore.collection('stocks').doc(sym).collection('annual_data').doc(String(y)).get();
+                if (doc.exists) {
+                    result.push({ 
+                        id: `${sym}_${y}`, 
+                        symbol: sym, 
+                        year: String(y), 
+                        data: doc.data() 
+                    });
+                }
+            }
+        }
+
+        res.json({ success: true, data: result });
+    } catch (error) {
+        console.error("Download Stocks Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// [신규 11-2번용] 기업 이벤트(배당/분할) 데이터 청크 다운로드 API
+// 클라이언트에서 넘긴 종목 배열을 기반으로 stocks/{symbol}/actions/{doc} 수집
+// ============================================================
+router.post('/download-stocks-actions-chunk', verifyToken, async (req, res) => {
+    try {
+        const { symbols } = req.body;
+        const user = req.user;
+
+        // 권한 방어
+        if (!['admin', 'G9'].includes(user.role)) {
+            return res.status(403).json({ error: "관리자 전용 기능입니다." });
+        }
+        if (!symbols || !Array.isArray(symbols)) {
+            return res.status(400).json({ error: "요청 심볼 리스트가 필요합니다." });
+        }
+
+        const result = [];
+
+        // 배당과 분할 문서를 비동기로 동시에 요청해서 속도 최적화
+        const fetchPromises = symbols.map(async (sym) => {
+            const actionsRef = firestore.collection('stocks').doc(sym).collection('actions');
+            
+            const [divDoc, splitDoc] = await Promise.all([
+                actionsRef.doc('dividends').get(),
+                actionsRef.doc('splits').get()
+            ]);
+
+            if (divDoc.exists) {
+                result.push({ 
+                    id: `${sym}_dividends`, 
+                    symbol: sym, 
+                    type: 'dividends', 
+                    data: divDoc.data() 
+                });
+            }
+            
+            if (splitDoc.exists) {
+                result.push({ 
+                    id: `${sym}_splits`, 
+                    symbol: sym, 
+                    type: 'splits', 
+                    data: splitDoc.data() 
+                });
+            }
+        });
+
+        // 100개 종목의 배당/분할 쿼리를 병렬 처리
+        await Promise.all(fetchPromises);
+
+        res.json({ success: true, data: result });
+    } catch (error) {
+        console.error("Download Actions Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// [신규 12, 13번용] 다건 일괄 업로드 (Batch Upload)
+// 클라이언트 로컬에서 집계된 데이터를 Firestore로 초고속 덮어쓰기
+// ============================================================
+router.post('/batch-upload', verifyToken, async (req, res) => {
+    try {
+        const { collectionName, items } = req.body;
+        const user = req.user;
+
+        if (!collectionName || !items || !Array.isArray(items) || items.length === 0) {
+            return res.status(400).json({ error: "컬렉션 이름과 업로드할 데이터 목록은 필수입니다." });
+        }
+
+        const rule = COLLECTION_RULES[collectionName];
+        if (rule && !rule(user, items[0].docId, items[0].data)) {
+            return res.status(403).json({ error: "해당 컬렉션에 대한 일괄 업로드 권한이 없습니다." });
+        }
+
+        console.log(`🚀 [Batch Upload] ${collectionName} - ${items.length}건 업로드 시작`);
+
+        // Firestore 트랜잭션 제한 (한 번에 500개) 돌파를 위해 청크 분할
+        const CHUNK_SIZE = 450;
+        let totalUploaded = 0;
+
+        for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+            const chunk = items.slice(i, i + CHUNK_SIZE);
+            const batch = firestore.batch();
+            const colRef = firestore.collection(collectionName);
+
+            chunk.forEach(item => {
+                const docRef = colRef.doc(item.docId);
+                const finalData = { ...item.data };
+                
+                // Firestore 내장 명령어 치환 로직 (기존 공통 로직 재사용)
+                Object.keys(finalData).forEach(key => {
+                    if (finalData[key] === "SERVER_TIMESTAMP") {
+                        finalData[key] = admin.firestore.FieldValue.serverTimestamp();
+                    }
+                    if (finalData[key] === "DELETE_FIELD") {
+                        finalData[key] = admin.firestore.FieldValue.delete();
+                    }
+                });
+
+                // null을 delete 명령으로 컨버팅하는 기존 재귀 함수 적용
+                if (typeof convertNullToDelete === "function") {
+                    convertNullToDelete(finalData);
+                }
+                
+                finalData.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+
+                // Merge: true 옵션으로 덮어쓰기
+                batch.set(docRef, finalData, { merge: true });
+            });
+
+            await batch.commit();
+            totalUploaded += chunk.length;
+        }
+
+        console.log(`✅ [Batch Upload] ${collectionName} - 총 ${totalUploaded}건 업로드 완료`);
+        res.json({ success: true, count: totalUploaded, message: "일괄 업로드가 완벽히 적용되었습니다." });
+
+    } catch (error) {
+        console.error("Batch Upload Error:", error);
         res.status(500).json({ error: error.message });
     }
 });

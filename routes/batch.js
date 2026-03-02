@@ -15,6 +15,7 @@ const { verifyToken, verifyBatchOrAdmin } = require('../utils/authHelper');
 const { logTraffic } = require('../utils/logger');
 const { performAnalysisInternal } = require('../utils/analysisEngine');
 const { getDaysDiff } = require('../utils/math');
+const StatsEngine = require('../utils/statsCalculator'); // 🌟 [추가] 공통 계산 엔진
 
 // 날짜 배열 유틸리티 함수
 function getDatesInRange(startStr, endStr) {
@@ -38,10 +39,10 @@ function getTodayByCountry(country) {
     return formatter.format(new Date());
 }
 
-// 종목 통계데이터 집계
-// 종목 통계데이터 집계
+// 종목 통계데이터 집계 (배치 잡 및 수동 호출 대응)
 router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
     try {
+        // [수정] 배치 잡(Github Actions)에서 넘어오는 최소한의 payload 대응 보강
         const { country, startSymbol, endSymbol, startDate, endDate } = req.body;
         let tickers = req.body.tickers || [];
         
@@ -50,10 +51,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
             console.log(`👉 [Batch] ${country || '전체'} 대상 종목 리스트 확보 중...`);
             
             let query = firestore.collection('stocks').where('active', '==', true);
-            
-            if (country) {
-                query = query.where('country', '==', country);
-            }
+            if (country) query = query.where('country', '==', country);
 
             const snapshot = await query.select().get();
             tickers = snapshot.docs.map(doc => doc.id);
@@ -67,16 +65,20 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                 if (!tickers.includes(idx)) tickers.push(idx);
             });
 
-            // 배열에 합친 후 전체 정렬
+            // 배열 정렬 및 심볼 범위 필터링
             tickers.sort();
-            
             if (startSymbol) tickers = tickers.filter(t => t >= startSymbol);
             if (endSymbol) tickers = tickers.filter(t => t <= endSymbol);
         }
 
+        // [수정] 배치 잡 구동 시 startDate가 없으면 국가별 타임존을 적용한 '오늘'로 자동 세팅
         const todayStr = getTodayByCountry(country);
-        const targetDates = getDatesInRange(startDate || todayStr, endDate || startDate || todayStr);
+        const actualStartDate = startDate || todayStr;
+        const actualEndDate = endDate || actualStartDate;
+        
+        const targetDates = getDatesInRange(actualStartDate, actualEndDate);
 
+        // 배치 잡은 즉시 응답을 받고 백그라운드에서 동작해야 하므로 응답 먼저 전송
         res.json({ result: 'Batch triggered (Background)', count: tickers.length, dates: targetDates.length });
 
         setImmediate(async () => {
@@ -108,7 +110,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
 
             const periods = [5, 10, 20, 40, 60, 120, 240, 480, 'all'];
 
-            // 3. 날짜별 루프
+            // 3. 날짜별 루프 시작
             for (const targetDate of targetDates) {
                 const dayOfWeek = new Date(targetDate).getDay(); 
                 if (dayOfWeek === 0 || dayOfWeek === 6) {
@@ -116,9 +118,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                     continue; 
                 }
 
-                // -------------------------------------------------------------------
-                // [Optimization] 대표 '지수'를 통한 휴장일 체크
-                // -------------------------------------------------------------------
+                // 휴장일 체크 로직 (생략 없이 기존과 동일하게 유지)
                 const targetYear = parseInt(targetDate.split('-')[0]);
                 const benchmarkTicker = (country === 'KR') ? '^KS11' : '^GSPC';
                 
@@ -135,8 +135,6 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                             console.log(`⏭️ [Skip] ${targetDate} : 휴장일입니다. (${benchmarkTicker} 데이터 없음)`);
                             continue;
                         }
-                    } else {
-                        console.warn(`⚠️ [Check] ${targetYear}년도 지수(${benchmarkTicker}) 데이터가 없습니다. 휴장일 체크를 건너뛰고 진행합니다.`);
                     }
                 } catch (bmError) {
                     console.warn(`⚠️ [Check] 휴장일 확인 중 에러 발생: ${bmError.message}`);
@@ -150,7 +148,6 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                 let chunkIndex = 0;
                 const WRITE_CHUNK_SIZE = 100;
 
-                // 그룹(국가/섹터/산업)별 누적을 위한 객체
                 const groupDailyAgg = {}; 
 
                 for (let i = 0; i < tickers.length; i += WRITE_CHUNK_SIZE) {
@@ -175,101 +172,23 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                                     }
                                 });
 
+                                // 데이터 날짜 최신순 정렬 필수
                                 combinedHistory.sort((a, b) => new Date(b.date) - new Date(a.date));
                                 if (combinedHistory.length === 0) return;
 
-                                const idx = combinedHistory.findIndex(h => h.date === targetDate);
-                                if (idx === -1) return;
-
-                                const dayData = combinedHistory[idx];
-                                const todayClose = dayData.close;
-                                const todayVolume = dayData.volume || 0;
-                                
-                                const mktCap = dayData.mktCap || 0;
-                                const volumeAmt = Math.round(todayClose * todayVolume);
-                                
                                 const masterInfo = stockMasterInfo[ticker] || { industry: '', sector: '', isEtf: false };
-                                const myThemes = themeMap[ticker] || [];
 
-                                const stats = {
-                                    close: todayClose, mktCap: mktCap, volume_amt: volumeAmt,
-                                    industry: masterInfo.industry, themes: myThemes,
-                                    perf_vs_prev: {}, perf_vs_low: {}, perf_vs_high: {},
-                                    prev_low: {}, prev_high: {}, is_new_low: {}, is_new_high: {}, 
-                                    sma: {}, avg_volume_amt_20d: 0, low_240d: 0, high_240d: 0
-                                };
+                                // 🌟🌟🌟 [핵심] 공통 계산 엔진 호출 🌟🌟🌟
+                                const stats = StatsEngine.calculateDailyStats(ticker, combinedHistory, targetDate, masterInfo);
 
-                                const calculateReturn = (current, past) => {
-                                    if (!past || past === 0 || !current) return 0;
-                                    const res = ((current - past) / past) * 100;
-                                    return isFinite(res) ? parseFloat(res.toFixed(2)) : 0;
-                                };
+                                if (!stats) return; // 계산 실패(데이터 없음 등) 시 패스
 
-                                [1, 2, 3, 4, 5, 10, 20, 40, 60, 120, 240, 480].forEach(d => {
-                                    const pastData = combinedHistory[idx + d];
-                                    const pastClose = pastData ? pastData.close : 0;
-                                    stats.perf_vs_prev[`${d}d`] = calculateReturn(todayClose, pastClose);
-                                });
-
-                                periods.forEach(d => {
-                                    const key = d === 'all' ? 'all' : `${d}d`;
-                                    let sliceStart = idx + 1;
-                                    let sliceEnd = d === 'all' ? combinedHistory.length : idx + 1 + d;
-
-                                    if (combinedHistory.length > sliceStart) {
-                                        const slice = combinedHistory.slice(sliceStart, sliceEnd);
-                                        const validPrices = slice.map(h => h.close).filter(v => v > 0);
-
-                                        const prevLow = validPrices.length > 0 ? Math.min(...validPrices) : 0;
-                                        const prevHigh = validPrices.length > 0 ? Math.max(...validPrices) : 0;
-
-                                        stats.prev_low[key] = prevLow;
-                                        stats.prev_high[key] = prevHigh;
-                                        stats.perf_vs_low[key] = calculateReturn(todayClose, prevLow);
-                                        stats.perf_vs_high[key] = calculateReturn(todayClose, prevHigh);
-
-                                        stats.is_new_low[key] = prevLow > 0 && todayClose < prevLow;
-                                        stats.is_new_high[key] = prevHigh > 0 && todayClose > prevHigh;
-                                        
-                                        if (d === 240) {
-                                            stats.low_240d = prevLow;
-                                            stats.high_240d = prevHigh;
-                                        }
-                                    } else {
-                                        stats.prev_low[key] = 0; stats.prev_high[key] = 0;
-                                        stats.perf_vs_low[key] = 0; stats.perf_vs_high[key] = 0;
-                                        stats.is_new_low[key] = false; stats.is_new_high[key] = false;
-                                    }
-                                });
-
-                                [5, 10, 20, 50, 100, 200].forEach(d => {
-                                    if (combinedHistory.length >= idx + d) {
-                                        const slice = combinedHistory.slice(idx, idx + d);
-                                        const validPrices = slice.map(h => h.close).filter(v => v > 0);
-                                        if (validPrices.length === d) {
-                                            const sum = validPrices.reduce((acc, curr) => acc + curr, 0);
-                                            stats.sma[`${d}d`] = parseFloat((sum / d).toFixed(2));
-                                        } else {
-                                            stats.sma[`${d}d`] = 0;
-                                        }
-                                    } else {
-                                        stats.sma[`${d}d`] = 0;
-                                    }
-                                });
-
-                                const volAvgDays = 20;
-                                if (combinedHistory.length >= idx + volAvgDays) {
-                                    const volSlice = combinedHistory.slice(idx, idx + volAvgDays);
-                                    const volSum = volSlice.reduce((acc, curr) => acc + ((curr.close || 0) * (curr.volume || 0)), 0);
-                                    stats.avg_volume_amt_20d = Math.round(volSum / volAvgDays);
-                                }
+                                // 테마 정보는 공통 계산기 밖에서 주입
+                                stats.themes = themeMap[ticker] || [];
 
                                 batchData[ticker] = stats;
                                 successCount++;
 
-                                // ---------------------------------------------------------------
-                                // 🌟 [핵심 수정] 그룹 집계 데이터 누적 시 꼬리표(meta) 명확하게 붙이기
-                                // ---------------------------------------------------------------
                                 const isEtf = masterInfo.isEtf;
                                 const isIndex = ticker.startsWith('^');
 
@@ -278,26 +197,14 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                                     const sec = masterInfo.sector;
                                     const ind = masterInfo.industry;
 
-                                    // 배열에 타입과 이름 메타데이터를 직접 객체로 담아서 전달
                                     const groupsToUpdate = [];
-                                    
-                                    // 1. 국가 전체 데이터 꼬리표
                                     groupsToUpdate.push({ key: ctry, type: 'COUNTRY', name: ctry, parentSectorKey: null });
-                                    
-                                    // 2. 섹터 전체 데이터 꼬리표
-                                    if (sec) {
-                                        groupsToUpdate.push({ key: `${ctry}_${sec}`, type: 'SECTOR', name: sec, parentSectorKey: `${ctry}_${sec}` });
-                                    }
-                                    
-                                    // 3. 산업 데이터 꼬리표 (부모 섹터 키를 같이 넘겨줌)
-                                    if (sec && ind) {
-                                        groupsToUpdate.push({ key: `${ctry}_${ind}`, type: 'INDUSTRY', name: ind, parentSectorKey: `${ctry}_${sec}` });
-                                    }
+                                    if (sec) groupsToUpdate.push({ key: `${ctry}_${sec}`, type: 'SECTOR', name: sec, parentSectorKey: `${ctry}_${sec}` });
+                                    if (sec && ind) groupsToUpdate.push({ key: `${ctry}_${ind}`, type: 'INDUSTRY', name: ind, parentSectorKey: `${ctry}_${sec}` });
 
                                     groupsToUpdate.forEach(meta => {
                                         const gKey = meta.key;
                                         if (!groupDailyAgg[gKey]) {
-                                            // 초기화 할 때 meta 정보를 객체 안에 저장해둠
                                             groupDailyAgg[gKey] = { total: 0, new_high: {}, new_low: {}, meta: meta };
                                             periods.forEach(p => {
                                                 const pKey = p === 'all' ? 'all' : `${p}d`;
@@ -340,74 +247,45 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                     updatedAt: new Date().toISOString()
                 }, { merge: true });
 
-                // -------------------------------------------------------------------
-                // 🌟 [핵심 수정] 저장해 둔 꼬리표(meta)를 읽어서 섹터별-년도별로 묶기
-                // -------------------------------------------------------------------
-
                 if (Object.keys(groupDailyAgg).length > 0) {
-                    
                     const sectorBundles = {};
                     const countryTotalBundle = {}; 
 
                     for (const [groupKey, groupData] of Object.entries(groupDailyAgg)) {
-                        
-                        const rates = {
-                            totalCount: groupData.total,
-                            new_high_rate: {},
-                            new_low_rate: {}
-                        };
+                        const rates = { totalCount: groupData.total, new_high_rate: {}, new_low_rate: {} };
                         periods.forEach(p => {
                             const pKey = p === 'all' ? 'all' : `${p}d`;
                             rates.new_high_rate[pKey] = groupData.total > 0 ? parseFloat(((groupData.new_high[pKey] / groupData.total) * 100).toFixed(2)) : 0;
                             rates.new_low_rate[pKey] = groupData.total > 0 ? parseFloat(((groupData.new_low[pKey] / groupData.total) * 100).toFixed(2)) : 0;
                         });
                         
-                        // 집계 로직에서 심어둔 꼬리표 꺼내기
                         const meta = groupData.meta;
-                        const parentKey = meta.parentSectorKey; // 예: "US_Technology"
-                        const myName = meta.name;               // 예: "Semiconductors"
+                        const parentKey = meta.parentSectorKey;
+                        const myName = meta.name;
 
                         if (meta.type === 'INDUSTRY') {
                             if (!sectorBundles[parentKey]) sectorBundles[parentKey] = {};
                             if (!sectorBundles[parentKey][myName]) sectorBundles[parentKey][myName] = {};
                             sectorBundles[parentKey][myName][targetDate] = rates;
-
                         } else if (meta.type === 'SECTOR') {
                             if (!sectorBundles[parentKey]) sectorBundles[parentKey] = {};
                             if (!sectorBundles[parentKey]['_SECTOR_TOTAL_']) sectorBundles[parentKey]['_SECTOR_TOTAL_'] = {};
                             sectorBundles[parentKey]['_SECTOR_TOTAL_'][targetDate] = rates;
-                            
                         } else if (meta.type === 'COUNTRY') {
                             countryTotalBundle[targetDate] = rates;
                         }
                     }
 
-                    // 2. 파이어스토어 저장 (Merge 옵션 필수)
                     const batch = firestore.batch();
 
-                    // (A) 섹터별 문서 저장 (ID: US_Technology_2026)
                     for (const [sectorKey, industriesData] of Object.entries(sectorBundles)) {
-                        const docId = `${sectorKey}_${targetYear}`; 
-                        const docRef = firestore.collection('meta_sector_stats').doc(docId);
-                        
-                        const payload = {
-                            country: country || 'US',
-                            year: String(targetYear),
-                            updatedAt: new Date().toISOString(),
-                            industries: industriesData 
-                        };
-                        
-                        batch.set(docRef, payload, { merge: true });
+                        const sDocId = `${sectorKey}_${targetYear}`; 
+                        const sDocRef = firestore.collection('meta_sector_stats').doc(sDocId);
+                        batch.set(sDocRef, { country: country || 'US', year: String(targetYear), updatedAt: new Date().toISOString(), industries: industriesData }, { merge: true });
                     }
 
-                    // (B) 국가 전체 문서 저장 (ID: US_Total_2026)
                     const countryDocRef = firestore.collection('meta_sector_stats').doc(`${country || 'US'}_Total_${targetYear}`);
-                    batch.set(countryDocRef, {
-                        country: country || 'US',
-                        year: String(targetYear),
-                        updatedAt: new Date().toISOString(),
-                        data: countryTotalBundle
-                    }, { merge: true });
+                    batch.set(countryDocRef, { country: country || 'US', year: String(targetYear), updatedAt: new Date().toISOString(), data: countryTotalBundle }, { merge: true });
 
                     await batch.commit();
                 }
