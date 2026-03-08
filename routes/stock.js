@@ -96,10 +96,10 @@ router.post('/get-attributes-bulk', verifyToken, async (req, res) => {
             if (doc.exists) {
                 const d = doc.data();
                 
-                // 🌟 [추가] 국가 코드 확인 및 필터링
+                // 🌟 [수정] 국가 코드 확인 및 필터링 (오직 US만 허용)
                 const country = (d.country || '').toUpperCase();
-                if (country && country !== 'US' && country !== 'KR') {
-                    return; // US, KR이 아니면 결과 매핑에서 아예 제외
+                if (country && country !== 'US') {
+                    return; // US가 아니면 결과 매핑에서 아예 제외
                 }
 
                 // 필요한 필드만 추출해서 반환
@@ -342,10 +342,10 @@ router.get('/inactive-list', verifyBatchOrAdmin, async (req, res) => {
         snapshot.forEach(doc => {
             const data = doc.data();
             
-            // 🌟 [추가] 국가 코드 확인 및 이중 필터링
+            // 🌟 [수정] 국가 코드 확인 및 이중 필터링 (오직 US만 허용)
             const stockCountry = (data.country || '').toUpperCase();
-            if (stockCountry && stockCountry !== 'US' && stockCountry !== 'KR') {
-                return; // US, KR이 아니면 결과 리스트에 담지 않음
+            if (stockCountry && stockCountry !== 'US') {
+                return; // US가 아니면 결과 리스트에 담지 않음
             }
 
             inactiveList.push({

@@ -29,9 +29,9 @@ function getDatesInRange(startStr, endStr) {
     return dates;
 }
 
-// 🌐 국가별 타임존을 적용하여 오늘 날짜(YYYY-MM-DD)를 구하는 함수
-function getTodayByCountry(country) {
-    const timeZone = (country === 'KR') ? 'Asia/Seoul' : 'America/New_York';
+// 🌐 미국 타임존을 적용하여 오늘 날짜(YYYY-MM-DD)를 구하는 함수 (US 전용)
+function getTodayUS() {
+    const timeZone = 'America/New_York';
     const formatter = new Intl.DateTimeFormat('en-CA', { 
         timeZone: timeZone, 
         year: 'numeric', month: '2-digit', day: '2-digit' 
@@ -42,24 +42,24 @@ function getTodayByCountry(country) {
 // 종목 통계데이터 집계 (배치 잡 및 수동 호출 대응)
 router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
     try {
-        // [수정] 배치 잡(Github Actions)에서 넘어오는 최소한의 payload 대응 보강
-        const { country, startSymbol, endSymbol, startDate, endDate } = req.body;
+        // [수정] 배치 잡(Github Actions)에서 넘어오는 최소한의 payload 대응 보강 (US 고정)
+        const { startSymbol, endSymbol, startDate, endDate } = req.body;
         let tickers = req.body.tickers || [];
         
         // 1. 대상 종목 리스트 확보
         if (tickers.length === 0) {
-            console.log(`👉 [Batch] ${country || '전체'} 대상 종목 리스트 확보 중...`);
+            console.log(`👉 [Batch] US 대상 종목 리스트 확보 중...`);
             
-            let query = firestore.collection('stocks').where('active', '==', true);
-            if (country) query = query.where('country', '==', country);
+            // 🌟 US 국가 종목만 쿼리
+            let query = firestore.collection('stocks')
+                .where('active', '==', true)
+                .where('country', '==', 'US');
 
             const snapshot = await query.select().get();
             tickers = snapshot.docs.map(doc => doc.id);
             
-            // 🌟 지수(Index)는 country 필드가 누락되어 있을 수 있으므로 수동으로 강제 포함
-            const coreIndices = country === 'KR' 
-                ? ['^KS11', '^KQ11', '^KS200', '^KRX100'] 
-                : ['^GSPC', '^IXIC', '^NDX', '^DJI', '^RUT', '^VIX', '^W5000']; // 기본값 US
+            // 🌟 미국 핵심 지수 강제 포함
+            const coreIndices = ['^GSPC', '^IXIC', '^NDX', '^DJI', '^RUT', '^VIX', '^W5000']; 
             
             coreIndices.forEach(idx => {
                 if (!tickers.includes(idx)) tickers.push(idx);
@@ -71,8 +71,8 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
             if (endSymbol) tickers = tickers.filter(t => t <= endSymbol);
         }
 
-        // [수정] 배치 잡 구동 시 startDate가 없으면 국가별 타임존을 적용한 '오늘'로 자동 세팅
-        const todayStr = getTodayByCountry(country);
+        // [수정] 배치 잡 구동 시 startDate가 없으면 뉴욕 타임존 '오늘'로 자동 세팅
+        const todayStr = getTodayUS();
         const actualStartDate = startDate || todayStr;
         const actualEndDate = endDate || actualStartDate;
         
@@ -82,7 +82,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
         res.json({ result: 'Batch triggered (Background)', count: tickers.length, dates: targetDates.length });
 
         setImmediate(async () => {
-            console.log(`🚀 [Batch] 통계 업데이트 시작 (국가: ${country || 'US'}, 기간: ${targetDates[0]}~${targetDates[targetDates.length-1]})`);
+            console.log(`🚀 [Batch] 통계 업데이트 시작 (국가: US, 기간: ${targetDates[0]}~${targetDates[targetDates.length-1]})`);
             
             // 2. 데이터 준비 (테마, 산업/섹터 정보 등)
             const themeMap = {};
@@ -98,7 +98,11 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
             });
 
             const stockMasterInfo = {};
-            const stocksSnap = await firestore.collection('stocks').where('active', '==', true).get();
+            const stocksSnap = await firestore.collection('stocks')
+                .where('active', '==', true)
+                .where('country', '==', 'US')
+                .get();
+
             stocksSnap.forEach(doc => {
                 const data = doc.data();
                 stockMasterInfo[doc.id] = { 
@@ -118,9 +122,9 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                     continue; 
                 }
 
-                // 휴장일 체크 로직 (생략 없이 기존과 동일하게 유지)
+                // 휴장일 체크 로직 (미국 S&P 500 기준)
                 const targetYear = parseInt(targetDate.split('-')[0]);
-                const benchmarkTicker = (country === 'KR') ? '^KS11' : '^GSPC';
+                const benchmarkTicker = '^GSPC'; // 🌟 미국 벤치마크 고정
                 
                 try {
                     const bmRef = firestore.collection('stocks').doc(benchmarkTicker)
@@ -141,7 +145,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                 }
                 
                 const requiredYears = [String(targetYear), String(targetYear - 1), String(targetYear - 2)];
-                const docId = `${targetDate}_${country || 'US'}`;
+                const docId = `${targetDate}_US`;
                 const docRef = firestore.collection('meta_ticker_stats').doc(docId);
                 
                 let successCount = 0;
@@ -193,7 +197,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                                 const isIndex = ticker.startsWith('^');
 
                                 if (!isEtf && !isIndex) {
-                                    const ctry = country || 'US';
+                                    const ctry = 'US'; // 🌟 US 고정
                                     const sec = masterInfo.sector;
                                     const ind = masterInfo.industry;
 
@@ -240,7 +244,7 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                 
                 await docRef.set({
                     date: targetDate,
-                    country: country || 'US',
+                    country: 'US',
                     isChunked: true,
                     chunkCount: chunkIndex,
                     totalCount: successCount,
@@ -281,11 +285,11 @@ router.post('/update-stats', verifyBatchOrAdmin, async (req, res) => {
                     for (const [sectorKey, industriesData] of Object.entries(sectorBundles)) {
                         const sDocId = `${sectorKey}_${targetYear}`; 
                         const sDocRef = firestore.collection('meta_sector_stats').doc(sDocId);
-                        batch.set(sDocRef, { country: country || 'US', year: String(targetYear), updatedAt: new Date().toISOString(), industries: industriesData }, { merge: true });
+                        batch.set(sDocRef, { country: 'US', year: String(targetYear), updatedAt: new Date().toISOString(), industries: industriesData }, { merge: true });
                     }
 
-                    const countryDocRef = firestore.collection('meta_sector_stats').doc(`${country || 'US'}_Total_${targetYear}`);
-                    batch.set(countryDocRef, { country: country || 'US', year: String(targetYear), updatedAt: new Date().toISOString(), data: countryTotalBundle }, { merge: true });
+                    const countryDocRef = firestore.collection('meta_sector_stats').doc(`US_Total_${targetYear}`);
+                    batch.set(countryDocRef, { country: 'US', year: String(targetYear), updatedAt: new Date().toISOString(), data: countryTotalBundle }, { merge: true });
 
                     await batch.commit();
                 }
@@ -491,9 +495,10 @@ router.post('/generate-market-map-summary', verifyToken, async (req, res) => {
         console.log("🗺️ [Batch] Market Map 요약 데이터 생성 시작...");
         const db = admin.firestore();
         
-        // 1. 대상 종목 가져오기 (상장폐지 안 된 'active' 종목만)
+        // 1. 대상 종목 가져오기 (상장폐지 안 된 'active' 종목이면서 US 국가인 데이터만)
         const snapshot = await db.collection('stocks')
             .where('active', '==', true)
+            .where('country', '==', 'US') // 🌟 US 필터 추가
             .get();
 
         if (snapshot.empty) {
@@ -510,29 +515,23 @@ router.post('/generate-market-map-summary', verifyToken, async (req, res) => {
             if (val === undefined || val === null || isNaN(val)) return 0;
             
             // 1. 시가총액(MC): 백만달러 단위 -> 10억달러(B) 단위 정수로 변환
-            // 예: 15,400M (154억불) -> 15
             if (type === 'MC') return Math.round(val / 1000); 
 
             // 2. MDD: 5% 단위로 퉁치기 (구간화)
-            // 예: -12.5% -> -10, -18% -> -15
             if (type === 'MDD') return Math.floor(Math.round(val) / 5) * 5;
 
             // 3. 일반 수익률(CAGR, ROE 등): 소수점 날리고 반올림
-            // 예: 15.43% -> 15
             return Math.round(val);
         };
 
         // 2. 데이터 정제 (Loop)
         snapshot.docs.forEach(doc => {
             const data = doc.data();
-            const stats = data.stats || {}; // stats가 없으면 빈 객체
+            const stats = data.stats || {}; 
 
-            // 필수 데이터(IPO날짜, 시총)가 없으면 제외 (노이즈 방지)
+            // 필수 데이터(IPO날짜, 시총)가 없으면 제외
             if (!data.symbol || !data.ipoDate || !stats.market_cap) return;
             
-            // 너무 작은 잡주(Penny Stock) 제외 (예: 시총 100억원 미만)
-            // if (stats.market_cap < 10000000) return; 
-
             // 상장 경과 년수 계산
             const ipoYear = parseInt(data.ipoDate.split('-')[0]);
             const listingYears = currentYear - ipoYear;
@@ -540,28 +539,27 @@ router.post('/generate-market-map-summary', verifyToken, async (req, res) => {
 
             // [핵심] 필드명을 알파벳 하나로 줄여서 전송량 30% 절약
             summaryItems.push({
-                s: data.symbol,                                   // 티커
-                n: data.name_kr || data.name_en || data.symbol,   // 이름 (툴팁용)
-                ex: data.exchange,                                // 거래소 (필터링용)
-                sec: data.sector || 'Etc',                        // 섹터 (색상 구분용)
+                s: data.symbol,                                   
+                n: data.name_kr || data.name_en || data.symbol,   
+                ex: data.exchange,                                
+                sec: data.sector || 'Etc',                        
                 
                 // --- X, Y축 후보군 (전부 정수형으로 변환됨) ---
-                y: listingYears,                                  // 상장년수
-                mc: compress(stats.market_cap, 'MC'),             // 시가총액 (Size)
+                y: listingYears,                                  
+                mc: compress(stats.market_cap, 'MC'),             
                 
-                p: compress(stats.price_cagr_10y),                // 주가 CAGR (10y)
-                e: compress(stats.eps_cagr_10y),                  // EPS CAGR (10y)
-                r: compress(stats.rev_cagr_10y),                  // 매출 성장률 (10y)
-                roe: compress(stats.avg_roe_5y),                  // ROE (5y Avg)
-                mdd: compress(stats.mdd, 'MDD'),                  // MDD (Max Drawdown)
-                per: compress(stats.per_current)                  // PER
+                p: compress(stats.price_cagr_10y),                
+                e: compress(stats.eps_cagr_10y),                  
+                r: compress(stats.rev_cagr_10y),                  
+                roe: compress(stats.avg_roe_5y),                  
+                mdd: compress(stats.mdd, 'MDD'),                  
+                per: compress(stats.per_current)                  
             });
         });
 
         console.log(`✨ 유효 데이터 추출 완료: ${summaryItems.length}개`);
 
         // 3. 청크(Chunk) 분할 저장 
-        // Firestore 문서 하나당 1MB 제한이 있으므로, 2000개씩 잘라서 저장
         const CHUNK_SIZE = 2000;
         const totalChunks = Math.ceil(summaryItems.length / CHUNK_SIZE);
         const batchHandler = db.batch();
@@ -600,6 +598,105 @@ router.post('/generate-market-map-summary', verifyToken, async (req, res) => {
         console.error("Market Map Summary Error:", err);
         res.status(500).json({ error: err.message });
     }
+});
+
+// ============================================================
+// [신규 API] 산업별 모멘텀 랭킹 집계 (기간 지정 및 공통 엔진 사용)
+// ============================================================
+router.post('/update-industry-momentum', verifyBatchOrAdmin, async (req, res) => {
+    const { startDate, endDate } = req.body;
+    
+    // 프론트엔드 대기 방지
+    res.json({ success: true, message: "산업별 모멘텀 랭킹 집계 시작 (백그라운드)" });
+
+    setImmediate(async () => {
+        try {
+            const targetCountry = 'US'; // 🌟 US 고정
+            const todayStr = getTodayUS();
+            const actualStartDate = startDate || todayStr;
+            const actualEndDate = endDate || actualStartDate;
+            const targetDates = getDatesInRange(actualStartDate, actualEndDate);
+
+            console.log(`🚀 [Batch] 산업 모멘텀 집계 시작 (${actualStartDate} ~ ${actualEndDate})`);
+            
+            // 1. 마스터 정보 로드 (산업 Meta)
+            const sectorMetaSnap = await firestore.collection('meta_sectors').doc('GICS_Standard').get();
+            const sectorMeta = sectorMetaSnap.exists ? sectorMetaSnap.data() : {};
+            const industryMetaMap = {};
+            if (sectorMeta.industryList) {
+                sectorMeta.industryList.forEach(ind => {
+                    industryMetaMap[ind.key.toLowerCase()] = { name_ko: ind.name_ko || ind.name_en, etf_ticker: ind.etf_ticker || null };
+                });
+            }
+
+            // 2. Active 종목 마스터 로드 (US 필터)
+            const stockMasterInfoMap = {};
+            const stocksSnap = await firestore.collection('stocks')
+                .where('active', '==', true)
+                .where('country', '==', 'US')
+                .get();
+
+            stocksSnap.forEach(doc => {
+                const d = doc.data();
+                stockMasterInfoMap[doc.id] = { industry: d.industry || '', sector: d.sector || '', isEtf: d.isEtf === true };
+            });
+
+            // 3. 날짜별 루프 시작
+            for (const targetDate of targetDates) {
+                const dayOfWeek = new Date(targetDate).getDay();
+                if (dayOfWeek === 0 || dayOfWeek === 6) continue; // 주말 패스
+
+                const targetYear = targetDate.split('-')[0];
+                const requiredYears = [String(targetYear), String(targetYear - 1)]; // 60일 전 확보를 위해 2개년도 필요
+
+                // 해당 날짜 연산을 위한 전체 히스토리 로드 (메모리 주의)
+                const historyByTicker = {};
+                // 서버 부하를 줄이기 위해 청크 단위로 읽기
+                const CHUNK_SIZE = 100;
+                const tickers = Object.keys(stockMasterInfoMap);
+                
+                for (let i = 0; i < tickers.length; i += CHUNK_SIZE) {
+                    const chunk = tickers.slice(i, i + CHUNK_SIZE);
+                    await Promise.all(chunk.map(async (ticker) => {
+                        let combinedHistory = [];
+                        for (const yr of requiredYears) {
+                            const yDoc = await firestore.collection('stocks').doc(ticker).collection('annual_data').doc(yr).get();
+                            if (yDoc.exists) combinedHistory = combinedHistory.concat(yDoc.data().data || []);
+                        }
+                        if (combinedHistory.length > 0) {
+                            combinedHistory.sort((a, b) => new Date(b.date) - new Date(a.date)); // 내림차순 정렬 필수
+                            historyByTicker[ticker] = combinedHistory;
+                        }
+                    }));
+                }
+
+                // 🌟 공통 엔진 호출
+                const finalRankings = StatsEngine.calculateIndustryMomentum(targetDate, historyByTicker, stockMasterInfoMap, industryMetaMap);
+
+                if (finalRankings.length > 0) {
+                    // Point-in-Time 조회를 위해 날짜별 문서로 저장 (예: US_2026-03-02)
+                    const docId = `US_${targetDate}`;
+                    await firestore.collection('industry_momentum').doc(docId).set({
+                        date: targetDate,
+                        country: 'US',
+                        updatedAt: new Date().toISOString(),
+                        rankings: finalRankings
+                    });
+
+                    // 오늘 날짜인 경우 meta_stats 최신화
+                    if (targetDate === todayStr) {
+                        await firestore.collection('meta_stats').doc('meta_sync_status').set({
+                            industry_momentum_rank: { lastUpdated: new Date().toISOString(), version: Date.now(), totalIndustries: finalRankings.length }
+                        }, { merge: true });
+                    }
+                    console.log(`✅ [Batch] ${targetDate} 산업 모멘텀 집계 완료 (${finalRankings.length}개 산업)`);
+                }
+            }
+            console.log(`🏁 [Batch] 산업 모멘텀 전체 범위 완료`);
+        } catch (error) {
+            console.error("💥 Update Industry Momentum Error:", error);
+        }
+    });
 });
 
 module.exports = router;

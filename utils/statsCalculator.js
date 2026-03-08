@@ -14,61 +14,36 @@
         return isFinite(res) ? parseFloat(res.toFixed(2)) : 0;
     }
 
-    /**
-     * 핵심 계산 함수
-     * @param {string} ticker - 종목 코드
-     * @param {Array} history - 날짜 내림차순 정렬된 주가 배열 ([{date, close, volume...}, ...])
-     * @param {string} targetDate - 기준일자 (YYYY-MM-DD)
-     * @param {Object} masterInfo - { industry, sector, isEtf ... }
-     * @returns {Object} 계산된 통계 객체 (없으면 null)
-     */
     StatsEngine.calculateDailyStats = function(ticker, history, targetDate, masterInfo) {
-        // 1. 데이터 유효성 검사 및 인덱스 찾기
         if (!history || history.length === 0) return null;
-        
-        // 날짜 내림차순(최신이 위로) 보장
-        // (호출하는 쪽에서 정렬해서 주는 게 성능상 좋지만, 안전을 위해 체크 가능)
-        // history.sort((a, b) => new Date(b.date) - new Date(a.date));
 
         const idx = history.findIndex(h => h.date === targetDate);
-        if (idx === -1) return null; // 해당 날짜 데이터 없음
+        if (idx === -1) return null; 
 
         const dayData = history[idx];
         const todayClose = dayData.close;
         const todayVolume = dayData.volume || 0;
-        const mktCap = dayData.mktCap || 0; // 로컬/서버 데이터 구조에 따라 다를 수 있음
+        const mktCap = dayData.mktCap || 0; 
         const volumeAmt = Math.round(todayClose * todayVolume);
 
         const periods = [5, 10, 20, 40, 60, 120, 240, 480, 'all'];
 
-        // 2. 기본 구조 생성
         const stats = {
             close: todayClose,
             mktCap: mktCap,
             volume_amt: volumeAmt,
             industry: masterInfo.industry || '',
-            // 테마 정보는 계산기 밖에서 주입하거나, masterInfo에 포함해서 전달
-            perf_vs_prev: {}, 
-            perf_vs_low: {}, 
-            perf_vs_high: {},
-            prev_low: {}, 
-            prev_high: {}, 
-            is_new_low: {}, 
-            is_new_high: {}, 
-            sma: {}, 
-            avg_volume_amt_20d: 0, 
-            low_240d: 0, 
-            high_240d: 0
+            perf_vs_prev: {}, perf_vs_low: {}, perf_vs_high: {},
+            prev_low: {}, prev_high: {}, is_new_low: {}, is_new_high: {}, 
+            sma: {}, avg_volume_amt_20d: 0, low_240d: 0, high_240d: 0
         };
 
-        // 3. n일 전 대비 수익률 (Rate of Return)
         [1, 2, 3, 4, 5, 10, 20, 40, 60, 120, 240, 480].forEach(d => {
             const pastData = history[idx + d];
             const pastClose = pastData ? pastData.close : 0;
             stats.perf_vs_prev[`${d}d`] = calculateReturn(todayClose, pastClose);
         });
 
-        // 4. 기간별 고가/저가 분석 (High/Low Analysis)
         periods.forEach(d => {
             const key = d === 'all' ? 'all' : `${d}d`;
             let sliceStart = idx + 1;
@@ -86,7 +61,6 @@
                 stats.perf_vs_low[key] = calculateReturn(todayClose, prevLow);
                 stats.perf_vs_high[key] = calculateReturn(todayClose, prevHigh);
 
-                // 신고가/신저가 판별 (오늘 종가가 과거 고가보다 높으면 신고가)
                 stats.is_new_low[key] = prevLow > 0 && todayClose < prevLow;
                 stats.is_new_high[key] = prevHigh > 0 && todayClose > prevHigh;
                 
@@ -95,14 +69,12 @@
                     stats.high_240d = prevHigh;
                 }
             } else {
-                // 데이터 부족 시 초기화
                 stats.prev_low[key] = 0; stats.prev_high[key] = 0;
                 stats.perf_vs_low[key] = 0; stats.perf_vs_high[key] = 0;
                 stats.is_new_low[key] = false; stats.is_new_high[key] = false;
             }
         });
 
-        // 5. 이동평균선 (SMA)
         [5, 10, 20, 50, 100, 200].forEach(d => {
             if (history.length >= idx + d) {
                 const slice = history.slice(idx, idx + d);
@@ -118,7 +90,6 @@
             }
         });
 
-        // 6. 거래대금 20일 평균
         const volAvgDays = 20;
         if (history.length >= idx + volAvgDays) {
             const volSlice = history.slice(idx, idx + volAvgDays);
@@ -129,13 +100,76 @@
         return stats;
     };
 
-    // [모듈 내보내기 로직]
-    // 1. Node.js 환경 (Backend)
+    // 🌟 [추가] 산업 모멘텀 연산 (안전장치 100% 탑재)
+    StatsEngine.calculateIndustryMomentum = function(targetDate, historyByTicker, masterInfoMap, industryMetaMap) {
+        const industryAgg = {};
+
+        for (const [ticker, history] of Object.entries(historyByTicker)) {
+            const masterInfo = masterInfoMap[ticker] || {};
+            const sector = masterInfo.sector;
+            const industry = masterInfo.industry;
+
+            if (!sector || !industry || masterInfo.isEtf || ticker.startsWith('^')) continue;
+
+            const targetIdx = history.findIndex(h => h.date <= targetDate);
+            if (targetIdx === -1 || history[targetIdx].date !== targetDate) continue;
+
+            const dayData = history[targetIdx];
+            const mktCap = dayData.mktCap || masterInfo.mktCap || 0;
+            const currentPrice = dayData.close || 0;
+
+            // 과거 데이터에 시총(0)이 누락되어도 살려주고, 값이 있으면 3억 불 컷!
+            if ((mktCap > 0 && mktCap < 300000000) || currentPrice < 1) continue;
+
+            if (history.length <= targetIdx + 20) continue; 
+            const pastIdx = Math.min(targetIdx + 60, history.length - 1);
+            const pastPrice = history[pastIdx].close;
+
+            if (pastPrice <= 0) continue;
+
+            const momentumScore = ((currentPrice / pastPrice) - 1) * 100;
+            const indKey = industry.toLowerCase();
+
+            if (!industryAgg[indKey]) {
+                industryAgg[indKey] = { sector_en: sector, industry_en: industry, scores: [] };
+            }
+            industryAgg[indKey].scores.push(momentumScore);
+        }
+
+        const finalRankings = [];
+
+        for (const [indKey, aggData] of Object.entries(industryAgg)) {
+            const scores = aggData.scores;
+            if (scores.length < 3) continue; 
+
+            scores.sort((a, b) => a - b);
+            let median = 0;
+            const mid = Math.floor(scores.length / 2);
+            if (scores.length % 2 === 0) {
+                median = (scores[mid - 1] + scores[mid]) / 2;
+            } else {
+                median = scores[mid];
+            }
+
+            const metaInfo = industryMetaMap[indKey] || {};
+
+            finalRankings.push({
+                sector: aggData.sector_en,
+                industry: aggData.industry_en,
+                name_ko: metaInfo.name_ko || aggData.industry_en,
+                etf_ticker: metaInfo.etf_ticker || null,
+                median_momentum: parseFloat(median.toFixed(2)),
+                stock_count: scores.length
+            });
+        }
+
+        finalRankings.sort((a, b) => b.median_momentum - a.median_momentum);
+        return finalRankings;
+    };
+
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = StatsEngine;
-    } 
-    // 2. Browser 환경 (Frontend)
-    else {
+    } else {
         root.StatsEngine = StatsEngine;
     }
 

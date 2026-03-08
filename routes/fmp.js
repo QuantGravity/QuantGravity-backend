@@ -33,12 +33,11 @@ function isValidTicker(symbol) {
         return true;
     }
 
-    // 1. 점(.) 처리 (한국 주식 및 미국 특정 클래스)
+    // 1. 점(.) 처리 (미국 특정 클래스만 허용, 한국 삭제)
     if (sym.includes('.')) {
         const parts = sym.split('.');
         const suffix = parts[parts.length - 1];
         
-        if (suffix === 'KS' || suffix === 'KQ') return true;
         if (suffix === 'A' || suffix === 'B' || suffix === 'C') return true;
         
         console.log(`🚫 [거름망 작동] 특수 목적 주식(.) 차단: ${sym}`);
@@ -73,7 +72,6 @@ function isValidTicker(symbol) {
 // ===========================================================================
 // 동기화 에러 관리
 // ===========================================================================
-// [추가] 타입별 에러 발생 건수 요약 (좌측 메뉴 뱃지용)
 router.get('/sync-errors/summary', verifyToken, async (req, res) => {
     const summary = await errorManager.getSummary();
     res.json({ success: true, summary });
@@ -104,7 +102,7 @@ router.get('/sync-errors/list', verifyToken, async (req, res) => {
 router.post('/sync-ticker-master', verifyBatchOrAdmin, async (req, res) => {
     const { mode = 'FULL', limit = 100, exchangeCode } = req.body; 
     const crypto = require('crypto');
-    console.log(`🚀 [Ticker Sync] 모드: ${mode} / 자비스: 인덱스 정밀 분류 및 동기화 시작`);
+    console.log(`🚀 [Ticker Sync] 모드: ${mode} / 자비스: 인덱스 정밀 분류 및 동기화 시작 (US ONLY)`);
 
     if (mode === 'SAMPLE') {
         console.log("📢 [알림] 현재 '빠른 모드(SAMPLE)'로 동작 중입니다.");
@@ -133,7 +131,7 @@ router.post('/sync-ticker-master', verifyBatchOrAdmin, async (req, res) => {
         let params = { limit: 60000 }; 
         if (mode === 'SAMPLE') params.limit = limit;
         if (exchangeCode) params.exchange = exchangeCode;
-        else params.country = 'US,KR'; 
+        else params.country = 'US'; // 🌟 US 전용
 
         const resFmp = await fmpClient.get('/company-screener', { params });
         const responseData = resFmp.data || [];
@@ -145,10 +143,9 @@ router.post('/sync-ticker-master', verifyBatchOrAdmin, async (req, res) => {
         
         stockSnapshot.forEach(doc => {
             const data = doc.data();
-            // 🌟 DB에서 읽어온 데이터의 국가 확인
             const stockCountry = (data.country || '').toUpperCase();
-            if (stockCountry && stockCountry !== 'US' && stockCountry !== 'KR') {
-                return; // US, KR이 아니면 기존 맵에 담지 않고 무시
+            if (stockCountry && stockCountry !== 'US') { // 🌟 US 필터
+                return; 
             }
             existingStockMap.set(doc.id, data);
         });
@@ -162,15 +159,14 @@ router.post('/sync-ticker-master', verifyBatchOrAdmin, async (req, res) => {
             if (item.isFund === true) return; 
 
             const sym = item.symbol.toUpperCase();
-4
-            // 🌟 [여기 추가!] 살아있는 종목(Active)도 철벽 방어망 통과 여부 검사!
+
             if (!isValidTicker(sym)) {
-                return; // 불합격이면 즉시 버림
+                return; 
             }
 
             const apiCountry = (item.country || '').toUpperCase();
 
-            if (apiCountry !== 'US' && apiCountry !== 'KR') {
+            if (apiCountry !== 'US') { // 🌟 US 필터
                 return;
             }
 
@@ -178,17 +174,9 @@ router.post('/sync-ticker-master', verifyBatchOrAdmin, async (req, res) => {
             const rawEx = (item.exchangeShortName || '').toUpperCase();
             let cleanExchange = rawEx;
 
-            if (apiCountry === 'KR') {
-                cleanExchange = (rawEx === 'KSC' || sym.endsWith('.KS')) ? 'KOSPI' : 'KOSDAQ';
-                const pureTicker = sym.split('.')[0]; 
-                if (!pureTicker.endsWith('0')) {
-                    return; 
-                }
-            } else if (apiCountry === 'US') {
-                if (['NASDAQ', 'NMS', 'NGS'].includes(rawEx)) cleanExchange = 'NASDAQ';
-                else if (rawEx === 'NYSE') cleanExchange = 'NYSE';
-                else if (rawEx === 'AMEX') cleanExchange = 'AMEX';
-            }
+            if (['NASDAQ', 'NMS', 'NGS'].includes(rawEx)) cleanExchange = 'NASDAQ';
+            else if (rawEx === 'NYSE') cleanExchange = 'NYSE';
+            else if (rawEx === 'AMEX') cleanExchange = 'AMEX';
 
             if (rawEx === 'INDEX' || sym.startsWith('^')) {
                 cleanExchange = 'INDEX';
@@ -374,53 +362,40 @@ router.post('/load-stock-data', verifyToken, async (req, res) => {
 });
 
 // ===========================================================================
-// [2.1] 주가 전체 업데이트 (진단 로그 강화 + 미국시간 + 에러 추적)
-// ⚡ [수정] 아무나 호출하지 못하도록 verifyBatchOrAdmin 미들웨어 장착
-// ===========================================================================
-// ===========================================================================
 // [2.1] 주가 전체 업데이트 (실행 시점 현재일 전용)
 // ===========================================================================
 router.post('/daily-update-all', verifyBatchOrAdmin, async (req, res) => {
-    const { market } = req.body;
-    const targetMarket = market || 'US';
+    // 🌟 미국 고정
+    const timeZone = 'America/New_York';
+    const now = new Date();
+    const timeStr = now.toLocaleString("en-US", {
+        timeZone: timeZone, year: "numeric", month: "2-digit", day: "2-digit"
+    });
+    const [m, d, y] = timeStr.split('/');
+    const targetDate = `${y}-${m}-${d}`;
 
-    const getTodayInfoByMarket = (marketType) => {
-        const timeZone = (marketType === 'KR') ? 'Asia/Seoul' : 'America/New_York';
-        const now = new Date();
-        const timeStr = now.toLocaleString("en-US", {
-            timeZone: timeZone, year: "numeric", month: "2-digit", day: "2-digit"
-        });
-        const [m, d, y] = timeStr.split('/');
-        const targetDate = `${y}-${m}-${d}`;
-
-        const dayOfWeek = new Date(parseInt(y), parseInt(m) - 1, parseInt(d)).getDay();
-        const isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
-
-        return { targetDate, isWeekend };
-    };
-
-    const { targetDate, isWeekend } = getTodayInfoByMarket(targetMarket);
+    const dayOfWeek = new Date(parseInt(y), parseInt(m) - 1, parseInt(d)).getDay();
+    const isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
 
     if (isWeekend) {
-        console.log(`⏭️ [Daily Batch Skip] ${targetDate} (${targetMarket})은 주말이므로 주가 수집을 스킵합니다.`);
+        console.log(`⏭️ [Daily Batch Skip] ${targetDate} (US)은 주말이므로 주가 수집을 스킵합니다.`);
         return res.json({ 
             success: true, 
             date: targetDate,
-            message: `[${targetMarket}] 주말이므로 데이터 수집 배치를 건너뜁니다.` 
+            message: `[US] 주말이므로 데이터 수집 배치를 건너뜁니다.` 
         });
     }
 
     res.json({ 
         success: true, 
         date: targetDate,
-        message: `[${targetMarket}] 현재일 데이터 수집을 백그라운드에서 시작합니다.` 
+        message: `[US] 현재일 데이터 수집을 백그라운드에서 시작합니다.` 
     });
     
     setImmediate(async () => {
         try {
             console.log(`\n============== [Daily Batch Start] ==============`);
             
-            // 🌟 [수정] select에 'country' 필드 추가 및 필터링 로직 적용
             const snapshot = await admin.firestore().collection('stocks').select('type', 'exchange', 'country').get();
             const validSymbolsSet = new Set();
 
@@ -428,13 +403,9 @@ router.post('/daily-update-all', verifyBatchOrAdmin, async (req, res) => {
                 const sym = doc.id;
                 const data = doc.data() || {};
                 
-                // 🌟 국가 확인 및 제외
                 const country = (data.country || '').toUpperCase();
-                if (country && country !== 'US' && country !== 'KR') return;
+                if (country !== 'US') return; // 🌟 US 필터
 
-                let isKr = sym.startsWith('KR_') || ['KSC', 'KOE', 'KOSPI', 'KOSDAQ'].includes(data.exchange);
-                if (targetMarket === 'US' && isKr) return;
-                if (targetMarket === 'KR' && !isKr) return;
                 validSymbolsSet.add(sym);
             });
 
@@ -510,44 +481,38 @@ router.post('/batch-load-stock-data-period', verifyBatchOrAdmin, async (req, res
 // ===========================================================================
 // [2-2] 배치 및 청소 도구
 // ===========================================================================
-// ===========================================================================
-// [2-2] 배치 및 청소 도구
-// ===========================================================================
 router.post('/cleanup-garbage-stocks', verifyToken, async (req, res) => {
     try {
         const db = admin.firestore();
-        console.log("🧹 [Cleanup] 최종 청소 시작 (US, KR 외 모든 데이터 가차 없이 삭제)...");
+        console.log("🧹 [Cleanup] 최종 청소 시작 (US 외 모든 데이터 가차 없이 삭제)...");
 
         const collectionRef = db.collection('stocks');
         
-        // 🌟 [수정 핵심] listDocuments 대신 select를 사용하여 문서 ID와 country 필드만 초경량으로 가져옴
         const snapshot = await collectionRef.select('country').get();
         console.log(`🔎 전체 스캔 완료: 총 ${snapshot.size}개 문서 검열 중...`);
 
         let deleteTargets = [];
         let detectedSuffixes = new Set(); 
-        let countryDeletedCount = 0; // 국가 기준으로 잘려나간 종목 수 카운트
+        let countryDeletedCount = 0; 
 
         snapshot.forEach(doc => {
             const symbol = doc.id.toUpperCase().trim();
             const data = doc.data() || {};
-            // 데이터에 country가 없으면 빈 문자열로 세팅됨
             const country = (data.country || '').toUpperCase();
 
             let shouldDelete = false;
 
-            // 🛑 1. 국가(Country) 필터링: US, KR이 아니면 (비어있어도) 무조건 삭제
-            if (country !== 'US' && country !== 'KR') {
+            // 🛑 1. 국가(Country) 필터링: US가 아니면 무조건 삭제
+            if (country !== 'US') {
                 shouldDelete = true;
                 countryDeletedCount++;
             }
-            // 🛑 2. Strict Whitelist Check (티커 규칙 - 우선주/워런트 등)
+            // 🛑 2. Strict Whitelist Check
             else if (!isValidTicker(symbol)) {
                 shouldDelete = true;
                 if (symbol.includes('.')) detectedSuffixes.add('.' + symbol.split('.').pop());
             }
 
-            // 불합격 판정이 나면 삭제 배열에 추가
             if (shouldDelete) {
                 deleteTargets.push(doc.ref);
             }
@@ -563,7 +528,7 @@ router.post('/cleanup-garbage-stocks', verifyToken, async (req, res) => {
             const chunk = deleteTargets.slice(i, i + batchSize);
             await Promise.all(chunk.map(async (ref) => {
                 try {
-                    await db.recursiveDelete(ref); // 하위 컬렉션 포함 완전 삭제
+                    await db.recursiveDelete(ref); 
                     deleteCount++;
                     process.stdout.write('.');
                 } catch (e) { console.error(`❌ ${ref.id} 삭제 실패:`, e.message); }
@@ -627,7 +592,6 @@ router.post('/sync-index-master', verifyBatchOrAdmin, async (req, res) => {
         const db = admin.firestore();
         const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-        // 🌟 [수정 1] 문서 청크 분할 저장 헬퍼: exchangeCode 파라미터 추가 (기본값 'INDEX')
         const saveChunks = async (docId, desc, list, countryCode = 'US', exchangeCode = 'INDEX') => {
             const CHUNK_SIZE = 600;
             const mainRef = db.collection('meta_tickers').doc(docId);
@@ -640,7 +604,6 @@ router.post('/sync-index-master', verifyBatchOrAdmin, async (req, res) => {
                 await delBatch.commit();
             }
 
-            // 🌟 하드코딩 제거하고 파라미터로 넘어온 exchangeCode 사용
             await mainRef.set({ 
                 country: countryCode, 
                 exchange: exchangeCode, description: desc, 
@@ -661,15 +624,11 @@ router.post('/sync-index-master', verifyBatchOrAdmin, async (req, res) => {
             console.log(`✅ [저장 완료] ${docId} (${list.length}개)`);
         };
 
-        // ==========================================================
-        // [Step 1 & 2 통합] 대표 지수 대응 ETF 리스트 (비중 데이터 확보용)
-        // ==========================================================
         const etfTargets = [
-            { id: 'US_SP500', symbol: 'SPY', desc: 'S&P 500', country: 'US', step: '1/5' },
-            { id: 'US_NASDAQ100', symbol: 'QQQ', desc: 'NASDAQ 100', country: 'US', step: '2/5' },
-            { id: 'US_DOW30', symbol: 'DIA', desc: 'Dow Jones 30', country: 'US', step: '3/5' },
-            { id: 'US_SP100', symbol: 'OEF', desc: 'S&P 100', country: 'US', step: '4/5' },
-            { id: 'KR_MSCI_KOREA', symbol: 'EWY', desc: 'MSCI South Korea', country: 'KR', step: '5/5' }
+            { id: 'US_SP500', symbol: 'SPY', desc: 'S&P 500', country: 'US', step: '1/4' },
+            { id: 'US_NASDAQ100', symbol: 'QQQ', desc: 'NASDAQ 100', country: 'US', step: '2/4' },
+            { id: 'US_DOW30', symbol: 'DIA', desc: 'Dow Jones 30', country: 'US', step: '3/4' },
+            { id: 'US_SP100', symbol: 'OEF', desc: 'S&P 100', country: 'US', step: '4/4' }
         ];
 
         for (const target of etfTargets) {
@@ -692,10 +651,8 @@ router.post('/sync-index-master', verifyBatchOrAdmin, async (req, res) => {
                             weight: i.weightPercentage || i.weight || 0 
                         }));
 
-                        // 비중 순 정렬
                         list.sort((a, b) => b.weight - a.weight);
 
-                        // ETF 구성종목 메타 저장 (이 그룹 자체는 INDEX 성격이므로 'INDEX' 유지)
                         await saveChunks(target.id, `${target.desc} (via ${target.symbol} Holdings)`, list, target.country, 'INDEX');
                         success = true;
                     }
@@ -717,70 +674,50 @@ router.post('/sync-index-master', verifyBatchOrAdmin, async (req, res) => {
         console.log("⏳ Global Indices API 요청 전 3초 대기 중...");
         await delay(3000); 
 
-        // ==========================================================
-        // [Last Step] 전체 지수 리스트 수신 및 Stocks 등록 (USD/KRW 필터링 및 분리)
-        // ==========================================================
         try {
             console.log("📡 [Last Step] Global Indices 목록 요청 및 Stocks 전체 등록...");
             const allIdx = await fmpClient.get('/index-list');
             
             if(allIdx.data && Array.isArray(allIdx.data)) {
-                // 1. USD와 KRW 통화만 필터링
-                const filteredIndices = allIdx.data.filter(item => 
-                    item.currency === 'USD' || item.currency === 'KRW'
-                );
+                // 1. USD 통화만 필터링 🌟
+                const filteredIndices = allIdx.data.filter(item => item.currency === 'USD');
 
-                console.log(`✅ FMP 수신 완료: 전체 ${allIdx.data.length}개 지수 중, USD/KRW 대상 ${filteredIndices.length}개 필터링 완료!`);
+                console.log(`✅ FMP 수신 완료: 전체 ${allIdx.data.length}개 지수 중, USD 대상 ${filteredIndices.length}개 필터링 완료!`);
 
-                // 2. 국가별 배열로 분리하고 currency, country 정보 추가
                 const usIndices = [];
-                const krIndices = [];
 
                 filteredIndices.forEach(item => {
-                    const isUS = item.currency === 'USD';
-                    const country = isUS ? 'US' : 'KR';
-                    
-                    // 🌟 [수정 2] FMP API가 리턴하는 원본 거래소 코드 추출 (없으면 'INDEX'로 폴백)
                     const fmpExchange = item.exchangeShortName || item.stockExchange || 'INDEX';
                     
                     const mappedItem = {
                         symbol: item.symbol,
                         name: item.name, 
                         name_en: item.name,
-                        ex: fmpExchange,         // 🌟 FMP 거래소 코드 반영
+                        ex: fmpExchange,         
                         currency: item.currency, 
-                        country: country         
+                        country: 'US'         
                     };
 
-                    if (isUS) usIndices.push(mappedItem);
-                    else krIndices.push(mappedItem);
+                    usIndices.push(mappedItem);
                 });
 
-                // 3. Meta Tickers에 국가별로 나누어 저장
-                // 그룹 자체는 인덱스 모음이므로 meta_tickers용 거래소 코드는 'INDEX'로 지정
                 if (usIndices.length > 0) {
                     await saveChunks('US_INDEX', 'US Market Indices', usIndices, 'US', 'INDEX');
                 }
-                if (krIndices.length > 0) {
-                    await saveChunks('KR_INDEX', 'Korea Market Indices', krIndices, 'KR', 'INDEX');
-                }
 
-                // 4. Stocks 컬렉션에 전체 등록
                 console.log("💾 Stocks 컬렉션에 필터링된 지수 데이터를 동기화합니다...");
                 
                 let batch = db.batch();
                 let opCount = 0;
                 let savedCount = 0;
 
-                const allFilteredIndices = [...usIndices, ...krIndices];
-
-                for (const item of allFilteredIndices) {
+                for (const item of usIndices) {
                     const stockRef = db.collection('stocks').doc(item.symbol);
                     
                     batch.set(stockRef, {
                         symbol: item.symbol,
                         name_en: item.name_en,
-                        exchange: item.ex,        // 🌟 [수정 3] 하드코딩된 'INDEX' 대신 API 원본 값 매핑
+                        exchange: item.ex,        
                         isEtf: false,
                         active: true,
                         type: 'index',
@@ -796,7 +733,7 @@ router.post('/sync-index-master', verifyBatchOrAdmin, async (req, res) => {
                         await batch.commit();
                         batch = db.batch();
                         opCount = 0;
-                        console.log(`... ${savedCount} / ${allFilteredIndices.length} 저장 중`);
+                        console.log(`... ${savedCount} / ${usIndices.length} 저장 중`);
                         await delay(500); 
                     }
                 }
@@ -809,7 +746,7 @@ router.post('/sync-index-master', verifyBatchOrAdmin, async (req, res) => {
             throw err; 
         }
 
-        res.json({ success: true, message: "MSCI Korea 포함 지수 비중 동기화 완료! (USD/KRW 분류 저장)" });
+        res.json({ success: true, message: "지수 비중 동기화 완료! (USD 분류 저장)" });
     } catch (e) { 
         res.status(500).json({ error: e.message }); 
     }
@@ -824,7 +761,6 @@ router.post('/sync-delisted-master', verifyToken, async (req, res) => {
         let hasMoreData = true;
         const LIMIT = 1000; 
 
-        // 1. FMP에서 상장폐지 리스트 전체 수집
         while (hasMoreData) {
             try {
                 const response = await fmpClient.get('/delisted-companies', { params: { page: page, limit: LIMIT } });
@@ -839,17 +775,13 @@ router.post('/sync-delisted-master', verifyToken, async (req, res) => {
         if (allDelisted.length === 0) return res.json({ success: false, message: "데이터 없음" });
 
         const db = admin.firestore();
-
-        // 🌟 2. 기존 stocks 컬렉션 로드 (상태 변경 vs 신규 추가 판별용)
         console.log(">> 기존 stocks 데이터 확인 중...");
-        // 메모리 절약을 위해 상태 판별에 필요한 최소한의 필드만 가져옴
         const existingDocs = await db.collection('stocks').select('active', 'isDelisted', 'delistedDate').get();
         const existingMap = new Map();
         existingDocs.forEach(doc => existingMap.set(doc.id, doc.data()));
 
         const stocksBatchList = []; 
 
-        // 3. 데이터 분류 및 정제
         allDelisted.forEach(item => {
             if (!item.symbol) return;
             const sym = item.symbol.toUpperCase();
@@ -858,14 +790,11 @@ router.post('/sync-delisted-master', verifyToken, async (req, res) => {
 
             const existingData = existingMap.get(sym);
 
-            // 🛑 [케이스 1] 이미 우리 DB에 있는 종목 (상장 중이었다가 폐지된 경우)
             if (existingData) {
-                // 이미 완벽하게 상장폐지 처리되어 있다면 스킵 (불필요한 DB 쓰기 트랜잭션 방지)
                 if (existingData.active === false && existingData.isDelisted === true && existingData.delistedDate === item.delistedDate) {
                     return; 
                 }
 
-                // 기존의 소중한 프로필(한글명, 섹터 등)은 절대 건드리지 않고 상태값만 살짝 업데이트
                 stocksBatchList.push({
                     symbol: sym,
                     active: false,
@@ -873,20 +802,14 @@ router.post('/sync-delisted-master', verifyToken, async (req, res) => {
                     delistedDate: item.delistedDate || '',
                     updatedAt: new Date().toISOString()
                 });
-            } 
-            // 🛑 [케이스 2] 우리 DB에 없는 종목 (시스템 오픈 전 과거에 이미 상장폐지된 찐 유령 종목)
-            else {
+            } else {
                 let rawExchange = (item.exchange || 'Unknown').toUpperCase();
                 let country = null;
                 let currency = null;
                 let cleanExchange = rawExchange;
 
-                // 거래소 및 심볼 패턴으로 국가와 통화 유추
-                if (sym.endsWith('.KS') || sym.endsWith('.KQ') || (['KOSPI', 'KOSDAQ', 'KSE', 'KOE'].some(k => rawExchange.includes(k)))) {
-                    country = 'KR'; currency = 'KRW';
-                    if (rawExchange.includes('KOSDAQ') || sym.endsWith('.KQ')) cleanExchange = 'KOSDAQ';
-                    else cleanExchange = 'KOSPI'; 
-                } else if (['NASDAQ', 'NYSE', 'AMEX', 'NMS', 'NGS', 'PNK', 'OTC'].some(u => rawExchange.includes(u))) {
+                // 🌟 미국(US) 거래소만 파악
+                if (['NASDAQ', 'NYSE', 'AMEX', 'NMS', 'NGS', 'PNK', 'OTC'].some(u => rawExchange.includes(u))) {
                     country = 'US'; currency = 'USD';
                     if (rawExchange.includes('NASDAQ') || rawExchange.includes('NMS') || rawExchange.includes('NGS')) cleanExchange = 'NASDAQ';
                     else if (rawExchange.includes('NYSE')) cleanExchange = 'NYSE';
@@ -897,7 +820,6 @@ router.post('/sync-delisted-master', verifyToken, async (req, res) => {
 
                 if (!country || !currency) return; 
 
-                // 완전 신규 생성용 데이터 세팅
                 stocksBatchList.push({
                     symbol: sym,
                     name_en: item.companyName || '',
@@ -913,7 +835,6 @@ router.post('/sync-delisted-master', verifyToken, async (req, res) => {
             }
         });
 
-        // 4. DB 일괄 업데이트
         let batch = db.batch();
         let opCount = 0;
 
@@ -949,14 +870,13 @@ router.post('/sync-action-master', verifyToken, async (req, res) => {
         if (mode === 'SINGLE') {
             if (!symbol) return res.status(400).json({ error: "Symbol required for SINGLE mode" });
 
-            // 🌟 [추가] 단일 조회 시 해당 종목의 국가 필터링 확인
             const stockSnap = await db.collection('stocks').doc(symbol).get();
             if (stockSnap.exists) {
                 const stockData = stockSnap.data();
                 const stockCountry = (stockData.country || '').toUpperCase();
-                if (stockCountry && stockCountry !== 'US' && stockCountry !== 'KR') {
-                    console.log(`⏭️ [Skip] ${symbol}은 US/KR 국가가 아니므로 이벤트 동기화를 건너뜁니다.`);
-                    return res.json({ success: false, message: "US/KR 국가가 아니므로 제외됨" });
+                if (stockCountry && stockCountry !== 'US') { // 🌟 US 필터
+                    console.log(`⏭️ [Skip] ${symbol}은 US 국가가 아니므로 이벤트 동기화를 건너뜁니다.`);
+                    return res.json({ success: false, message: "US 국가가 아니므로 제외됨" });
                 }
             }
 
@@ -1020,13 +940,12 @@ router.post('/sync-action-master', verifyToken, async (req, res) => {
         if (mode === 'DAILY') {
             console.log("   👉 유효 종목 리스트 로딩 중...");
             
-            // 🌟 [수정] 국가 필드 함께 조회 및 필터링
             const snapshot = await db.collection('stocks').select('country').get();
             const validSymbols = new Set();
             snapshot.forEach(doc => {
                 const data = doc.data() || {};
                 const country = (data.country || '').toUpperCase();
-                if (country && country !== 'US' && country !== 'KR') return; // 국가 필터링
+                if (country && country !== 'US') return; // 🌟 US 필터
                 validSymbols.add(doc.id);
             }); 
             console.log(`   ✅ 유효 종목 ${validSymbols.size}개 로드 완료.`);
@@ -1179,16 +1098,14 @@ const ESSENTIAL_FIELDS = {
 async function saveFinancialsInternal(db, symbol) {
     const stockRef = db.collection('stocks').doc(symbol);
 
-    // [Step 1] 종목 정보 확인
     const docSnap = await stockRef.get();
     if (!docSnap.exists) return false;
 
     const stockData = docSnap.data();
 
-    // 🌟 [추가] DB에 등록된 국가 코드가 US나 KR이 아니면 스킵
     const stockCountry = (stockData.country || '').toUpperCase();
-    if (stockCountry && stockCountry !== 'US' && stockCountry !== 'KR') {
-        console.log(`⏩ [Skip] ${symbol} is not US/KR (${stockCountry})`);
+    if (stockCountry && stockCountry !== 'US') { // 🌟 US 필터
+        console.log(`⏩ [Skip] ${symbol} is not US (${stockCountry})`);
         return 'SKIPPED';
     }
 
@@ -1232,7 +1149,6 @@ async function saveFinancialsInternal(db, symbol) {
                 savedTypes.push(stmt.type);
             } 
         } catch (e) { 
-            // console.warn(`   ⚠️ [Skip] ${symbol} ${stmt.type}`);
         }
     }
 
@@ -1324,14 +1240,13 @@ router.post('/batch-financials', verifyToken, async (req, res) => {
             console.log("🚀 [Batch Financials] 전체 수집 시작...");
             const db = admin.firestore();
             
-            // 🌟 [수정] select에 'country' 추가 및 필터링
             const snapshot = await db.collection('stocks').where('active', '==', true).select('country').get();
             const symbols = [];
             
             snapshot.docs.forEach(doc => {
                 const data = doc.data() || {};
                 const country = (data.country || '').toUpperCase();
-                if (country && country !== 'US' && country !== 'KR') return; // 국가 필터링 적용
+                if (country && country !== 'US') return; // 🌟 US 필터
                 symbols.push(doc.id);
             });
             
@@ -1412,9 +1327,84 @@ router.post('/sync-sector-master', verifyToken, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ===========================================================================
+// 섹터 및 산업 정보 동기화.   대표 ETF 도 하드코딩으로 지정
+// ===========================================================================
 async function syncSectorMasterInternal() {
     const db = admin.firestore();
-    console.log("🚀 [Master Sync] 섹터/산업 데이터 동기화 시작...");
+    console.log("🚀 [Master Sync] 섹터/산업 데이터 동기화 시작 (ETF 세밀 매핑 포함)...");
+
+    // 🌟 1. 주요 11개 섹터 대표 ETF 매핑 사전
+    const SECTOR_ETF_MAP = {
+        "Technology": "XLK",
+        "Communication Services": "XLC",
+        "Consumer Cyclical": "XLY",
+        "Consumer Defensive": "XLP",
+        "Energy": "XLE",
+        "Financial Services": "XLF",
+        "Healthcare": "XLV",
+        "Industrials": "XLI",
+        "Basic Materials": "XLB",
+        "Real Estate": "XLRE",
+        "Utilities": "XLU",
+        "Financial": "XLF",       
+        "Services": "XLC",      
+        "Conglomerates": null, 
+        "General": null
+    };
+
+    // 🌟 2. 120개 중 핵심 주도 산업 대표 ETF 엄선 매핑 사전 (AUM 및 거래량 기준)
+    const INDUSTRY_ETF_MAP = {
+        "Semiconductors": "SOXX",
+        "Software - Infrastructure": "IGV",
+        "Software - Application": "IGV",
+        "Computer Hardware": "QQQ", // 하드웨어는 QQQ가 압도적 대용
+        "Consumer Electronics": "VGT",
+        "Biotechnology": "XBI",
+        "Drug Manufacturers - General": "PJP",
+        "Medical Devices": "IHI",
+        "Healthcare Plans": "IHF",
+        "Aerospace & Defense": "ITA",
+        "Airlines": "JETS",
+        "Auto Manufacturers": "CARZ",
+        "Banks - Regional": "KRE",
+        "Banks - Diversified": "KBE",
+        "Asset Management": "KCE",
+        "Capital Markets": "KCE",
+        "Insurance - Property & Casualty": "KIE",
+        "Insurance - Life": "KIE",
+        "Oil & Gas E&P": "XOP",
+        "Oil & Gas Midstream": "AMLP",
+        "Oil & Gas Refining & Marketing": "CRAK",
+        "Oil & Gas Equipment & Services": "XES",
+        "Gold": "GDX", // 금광주
+        "Other Precious Metals & Mining": "GDXJ",
+        "Copper": "COPX",
+        "Steel": "SLX",
+        "Internet Retail": "XRT",
+        "Apparel Retail": "XRT",
+        "Home Improvement Retail": "XHB",
+        "Residential Construction": "XHB",
+        "Building Products & Equipment": "XHB",
+        "Restaurants": "PBJ",
+        "Packaged Foods": "PBJ",
+        "Beverages - Non-Alcoholic": "PBJ",
+        "Household & Personal Products": "XLP",
+        "REITs - Retail": "VNQ",
+        "REITs - Residential": "REZ",
+        "REITs - Office": "VNQ",
+        "REITs - Healthcare": "VNQ",
+        "Solar": "TAN",
+        "Utilities - Regulated Electric": "XLU",
+        "Telecom Services": "XLC",
+        "Entertainment": "PEJ",
+        "Broadcasting": "PBS",
+        "Travel Services": "PEJ",
+        "Lodging": "PEJ",
+        "Trucking": "IYT",
+        "Railroads": "IYT",
+        "Integrated Freight & Logistics": "IYT"
+    };
 
     try {
         // 1. 기존 데이터 로드 (비교용)
@@ -1457,7 +1447,7 @@ async function syncSectorMasterInternal() {
             }
             if (Array.isArray(oldData.industryList)) {
                 oldData.industryList.forEach(i => {
-                    if (i.name_en) {
+                        if (i.name_en) {
                         translationMap.set(i.name_en, i.name_ko);
                         oldIndustryNames.push(i.name_en);
                     }
@@ -1513,8 +1503,12 @@ async function syncSectorMasterInternal() {
         const oldHierarchyStr = oldData ? sortObjectKeys(oldData.hierarchy) : "{}";
         const isHierarchySame = currentHierarchyStr === oldHierarchyStr;
 
+        // 🌟 기존 DB에 etf_ticker 필드가 없으면 최초 1회 업데이트 트리거
+        const needsSectorEtfUpdate = oldData && oldData.sectorList && oldData.sectorList.length > 0 && oldData.sectorList[0].etf_ticker === undefined;
+        const needsIndustryEtfUpdate = oldData && oldData.industryList && oldData.industryList.length > 0 && oldData.industryList[0].etf_ticker === undefined;
+
         // [중요] 변경사항 여부 판단
-        const hasActualChanges = !isSectorListSame || !isIndustryListSame || !isHierarchySame || newIndustries.length > 0;
+        const hasActualChanges = !isSectorListSame || !isIndustryListSame || !isHierarchySame || newIndustries.length > 0 || needsSectorEtfUpdate || needsIndustryEtfUpdate;
 
         // 모든 것이 똑같고, 번역할 신규 산업도 없다면 즉시 종료!
         if (!hasActualChanges) {
@@ -1522,7 +1516,7 @@ async function syncSectorMasterInternal() {
             return { success: true, updated: false, message: "변경사항 없음" };
         }
 
-        console.log(`⚡ 변경 감지됨! [섹터변경: ${!isSectorListSame}, 산업목록변경: ${!isIndustryListSame}, 계층구조변경: ${!isHierarchySame}, 신규산업: ${newIndustries.length}개]`);
+        console.log(`⚡ 변경 감지됨! [섹터: ${!isSectorListSame}, 산업: ${!isIndustryListSame}, 계층: ${!isHierarchySame}, 신규: ${newIndustries.length}개, ETF매핑적용: ${!!(needsSectorEtfUpdate || needsIndustryEtfUpdate)}]`);
         
         // 8. 🤖 신규 산업만 AI 번역 진행
         if (newIndustries.length > 0) {
@@ -1548,17 +1542,19 @@ async function syncSectorMasterInternal() {
             }
         }
 
-        // 9. 최종 데이터 조립
+        // 9. 최종 데이터 조립 (ETF 티커 매핑 포함)
         const structuredSectors = fmpSectors.map(en => ({
             key: en,
             name_en: en,
-            name_ko: FIXED_SECTOR_MAP[en] || translationMap.get(en) || en
+            name_ko: FIXED_SECTOR_MAP[en] || translationMap.get(en) || en,
+            etf_ticker: SECTOR_ETF_MAP[en] || null 
         }));
 
         const structuredIndustries = fmpIndustries.map(en => ({
             key: en,
             name_en: en,
-            name_ko: translationMap.get(en) || en
+            name_ko: translationMap.get(en) || en,
+            etf_ticker: INDUSTRY_ETF_MAP[en] || null // 🌟 산업별 ETF 매핑 적용
         }));
 
         // 10. Firestore 일괄 저장 (Batch) - 변경사항이 있을 때만 실행됨
@@ -1790,9 +1786,6 @@ async function processBulkDailyDataInternal(targetDate, validSymbolsSet) {
 
 // ===========================================================================
 // 종목별 과거 전체 주가 및 시가총액 데이터 수집 (Merge 로직 적용)
-// =========================================================================== 
-// ===========================================================================
-// 종목별 과거 전체 주가 및 시가총액 데이터 수집 (Merge 로직 적용)
 // ===========================================================================
 async function processStockHistoryData(arg1, arg2, arg3, arg4) {
     let symbol, from, to;
@@ -1807,23 +1800,18 @@ async function processStockHistoryData(arg1, arg2, arg3, arg4) {
         const fmpFrom = startDate.toISOString().split('T')[0];
         const fmpTo = endDate.toISOString().split('T')[0];
 
-        // 🌟 0. 기존 DB 정보 확인 (Bypass 여부 결정)
         const stockDoc = await admin.firestore().collection('stocks').doc(symbol).get();
         const existingData = stockDoc.exists ? stockDoc.data() : null;
         const isDelisted = existingData && existingData.isDelisted === true;
         
-        // 추가: 심볼이 '^'로 시작하면 지수(Index)로 판별
         const isIndex = symbol.startsWith('^'); 
 
         let targetCurrency = existingData ? existingData.currency : null;
 
-        // 1. 프로필 업데이트 (분기 처리)
         if (isIndex) {
-            // 🌟 지수 종목은 프로필 조회 생략
             console.log(`📈 [Bypass Profile] ${symbol}은 지수이므로 프로필 조회를 건너뜁니다.`);
-            targetCurrency = targetCurrency || 'USD'; // 미국 주식 기준 기본 통화 부여
+            targetCurrency = targetCurrency || 'USD'; 
         } else if (!isDelisted) {
-            // 기존 활성 종목 프로필 업데이트 로직
             try {
                 const profileRes = await fmpClient.get('/profile', { params: { symbol: symbol } });
                 const profile = (profileRes.data && profileRes.data.length > 0) ? profileRes.data[0] : null;
@@ -1834,7 +1822,7 @@ async function processStockHistoryData(arg1, arg2, arg3, arg4) {
                 }
 
                 targetCurrency = profile.currency.toUpperCase();
-                if (targetCurrency !== 'USD' && targetCurrency !== 'KRW') {
+                if (targetCurrency !== 'USD') { // 🌟 USD 필터
                     console.warn(`⚠️ [Skip] ${symbol}: 지원하지 않는 통화(${targetCurrency})`);
                     return { success: false, symbol: symbol, message: `지원하지 않는 통화(${targetCurrency})` };
                 }
@@ -1866,14 +1854,12 @@ async function processStockHistoryData(arg1, arg2, arg3, arg4) {
                 throw new Error(`Profile Load Error: ${e.message}`); 
             }
         } else {
-            // 🌟 상장폐지 종목은 프로필 조회 생략
             console.log(`👻 [Bypass Profile] ${symbol}은 상장폐지(Delisted) 종목이므로 프로필 조회를 건너뜁니다.`);
-            if (!targetCurrency || (targetCurrency !== 'USD' && targetCurrency !== 'KRW')) {
+            if (!targetCurrency || targetCurrency !== 'USD') { // 🌟 USD 필터
                 return { success: false, symbol: symbol, message: '상장폐지 종목이나 유효한 통화 키가 없음' };
             }
         }
 
-        // 2. 과거 시가총액 데이터 수집 (Map 생성)
         const histMktCapMap = new Map();
         try {
             const mcapRes = await fmpClient.get('/historical-market-capitalization', {
@@ -1886,7 +1872,6 @@ async function processStockHistoryData(arg1, arg2, arg3, arg4) {
             }
         } catch (e) { console.error(`❌ [MCap Error] ${symbol}: ${e.message}`); }
 
-        // 3. Historical Price 호출 (날짜 분할 호출 유지)
         const dateRanges = [];
         let current = new Date(startDate);
         while (current <= endDate) {
@@ -1920,7 +1905,6 @@ async function processStockHistoryData(arg1, arg2, arg3, arg4) {
         let mergedFetchedData = results.flat(); 
         if (mergedFetchedData.length === 0) return { success: true, message: `데이터 없음`, symbol };
 
-        // 4. 연도별 분류
         const chunks = {};
         mergedFetchedData.forEach(day => {
             const year = day.date.split('-')[0];
@@ -1928,7 +1912,6 @@ async function processStockHistoryData(arg1, arg2, arg3, arg4) {
             chunks[year].push(day);
         });
 
-        // 5. DB 저장 (Merge 로직 적용)
         for (const year of Object.keys(chunks)) {
             const chunkRef = admin.firestore().collection('stocks').doc(symbol).collection('annual_data').doc(year);
             const docSnap = await chunkRef.get();
